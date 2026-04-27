@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TFCU Voice Ticket Intake</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        background: #0f172a;
+        color: #e2e8f0;
+        margin: 0;
+      }
+      .container {
+        max-width: 920px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+      .card {
+        background: #1e293b;
+        border: 1px solid #334155;
+        border-radius: 10px;
+        padding: 16px;
+        margin-bottom: 14px;
+      }
+      .pill {
+        display: inline-block;
+        font-size: 12px;
+        border-radius: 999px;
+        padding: 4px 10px;
+        border: 1px solid #64748b;
+        color: #93c5fd;
+      }
+      .muted {
+        color: #94a3b8;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .empty {
+        border: 1px dashed #475569;
+        border-radius: 10px;
+        padding: 16px;
+      }
+      button {
+        background: #2563eb;
+        border: none;
+        color: #fff;
+        padding: 10px 14px;
+        border-radius: 8px;
+        cursor: pointer;
+        margin-right: 8px;
+      }
+      button.secondary {
+        background: #475569;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+      video {
+        width: 100%;
+        max-width: 420px;
+        border-radius: 10px;
+        border: 1px solid #334155;
+        background: #020617;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>TFCU Voice Ticket Intake</h1>
+      <p class="muted">
+        Temporary Cortex placeholder: submitted structured tickets are shown below.
+      </p>
+      <p class="muted">
+        Voice intake auto-detects when you are done speaking, then moves to the next question.
+      </p>
+      <div class="card">
+        <h3>Device Access</h3>
+        <p id="camera-status" class="muted">Requesting camera access...</p>
+        <p id="microphone-status" class="muted">Requesting microphone access...</p>
+        <p id="realtime-status" class="muted">Realtime idle.</p>
+        <button id="start-realtime">Start Realtime Voice</button>
+        <button id="start-typed-intake" class="secondary">Type Intent Instead</button>
+        <pre id="realtime-json" class="muted">(structured ticket preview appears here)</pre>
+        <pre id="realtime-debug" class="muted">(raw realtime event debug appears here)</pre>
+        <div id="typed-intake-panel" class="card" style="display: none;">
+          <h3>Typed Intent Intake</h3>
+          <p id="typed-question" class="muted"></p>
+          <input
+            id="typed-answer"
+            type="text"
+            style="width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #334155; background: #0b1220; color: #e2e8f0;"
+            placeholder="Type your answer here"
+          />
+          <div style="margin-top: 10px;">
+            <button id="typed-next">Next</button>
+            <button id="typed-cancel" class="secondary">Cancel</button>
+          </div>
+        </div>
+        <audio id="assistant-audio" autoplay></audio>
+        <video id="camera-preview" autoplay playsinline muted></video>
+      </div>
+      <div id="tickets"></div>
+    </div>
+
+    <script>
+      const ticketsEl = document.getElementById("tickets");
+      const cameraStatusEl = document.getElementById("camera-status");
+      const microphoneStatusEl = document.getElementById("microphone-status");
+      const realtimeStatusEl = document.getElementById("realtime-status");
+      const realtimeJsonEl = document.getElementById("realtime-json");
+      const realtimeDebugEl = document.getElementById("realtime-debug");
+      const startRealtimeBtn = document.getElementById("start-realtime");
+      const startTypedIntakeBtn = document.getElementById("start-typed-intake");
+      const typedIntakePanel = document.getElementById("typed-intake-panel");
+      const typedQuestionEl = document.getElementById("typed-question");
+      const typedAnswerEl = document.getElementById("typed-answer");
+      const typedNextBtn = document.getElementById("typed-next");
+      const typedCancelBtn = document.getElementById("typed-cancel");
+      const cameraPreviewEl = document.getElementById("camera-preview");
+      const assistantAudioEl = document.getElementById("assistant-audio");
+      let mediaStream = null;
+      let peerConnection = null;
+      let dataChannel = null;
+      let realtimeAwaitingTicket = false;
+      let realtimeAwaitingConversation = false;
+      let realtimeConversationInFlight = false;
+      let finalIntentRequested = false;
+      let intentSubmitted = false;
+      let realtimeIsActive = false;
+      let realtimeIsStopping = false;
+      let lastAutoCommitMs = 0;
+      const intentReadyMarker = "INTENT_READY";
+      const voiceIntakeQuestions = [
+        "What is your name?",
+        "What is the department?",
+        "What info do you want relayed?",
+      ];
+      const voiceIntakeKeys = ["requestor_name", "business_unit", "summary"];
+      let voiceIntakeStep = 0;
+      let voiceIntakeAnswers = {};
+      const voiceAcknowledgments = ["Got it.", "Thanks.", "Perfect.", "Nice.", "Okay."];
+      function randomVoiceAck() {
+        return voiceAcknowledgments[Math.floor(Math.random() * voiceAcknowledgments.length)];
+      }
+      const typedIntakeQuestions = [
+        { key: "requestor_name", prompt: "What is your name?" },
+        { key: "business_unit", prompt: "Which business unit is this for?" },
+        { key: "summary", prompt: "Give a short summary of the request." },
+        { key: "priority", prompt: "Priority (low, medium, high, urgent)?" },
+        { key: "metric", prompt: "What metric do you need?" },
+        { key: "time_period", prompt: "What time period should be used?" },
+        { key: "details", prompt: "Any extra details?" },
+      ];
+      let typedIntakeAnswers = {};
+      let typedIntakeIndex = 0;
+
+      async function startDevices() {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          cameraStatusEl.textContent = "Camera API not supported in this browser.";
+          microphoneStatusEl.textContent = "Microphone API not supported in this browser.";
+          return;
+        }
+
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: true,
+          });
+          cameraPreviewEl.srcObject = stream;
+          mediaStream = stream;
+          cameraStatusEl.textContent = "Camera is on.";
+          microphoneStatusEl.textContent = "Microphone is on.";
+        } catch (error) {
+          cameraStatusEl.textContent = `Camera access blocked: ${error.message}`;
+          microphoneStatusEl.textContent = `Microphone access blocked: ${error.message}`;
+        }
+      }
+
+      function safeJsonParse(text) {
+        try {
+          return JSON.parse(text);
+        } catch (error) {
+          return null;
+        }
+      }
+
+      function extractJsonObject(text) {
+        if (!text || typeof text !== "string") {
+          return null;
+        }
+
+        const direct = safeJsonParse(text.trim());
+        if (direct && typeof direct === "object") {
+          return direct;
+        }
+
+        const withoutFences = text.replace(/```json|```/gi, "").trim();
+        const fenceParsed = safeJsonParse(withoutFences);
+        if (fenceParsed && typeof fenceParsed === "object") {
+          return fenceParsed;
+        }
+
+        const firstBrace = withoutFences.indexOf("{");
+        const lastBrace = withoutFences.lastIndexOf("}");
+        if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+          const candidate = withoutFences.slice(firstBrace, lastBrace + 1);
+          const extracted = safeJsonParse(candidate);
+          if (extracted && typeof extracted === "object") {
+            return extracted;
+          }
+        }
+        return null;
+      }
+
+      function collectAllStringValues(value, out) {
+        if (value == null) {
+          return;
+        }
+        if (typeof value === "string") {
+          out.push(value);
+          return;
+        }
+        if (Array.isArray(value)) {
+          for (const item of value) {
+            collectAllStringValues(item, out);
+          }
+          return;
+        }
+        if (typeof value === "object") {
+          for (const key of Object.keys(value)) {
+            collectAllStringValues(value[key], out);
+          }
+        }
+      }
+
+      function renderTypedQuestion() {
+        const current = typedIntakeQuestions[typedIntakeIndex];
+        if (!current) {
+          return;
+        }
+        typedQuestionEl.textContent = current.prompt;
+        typedAnswerEl.value = "";
+        typedAnswerEl.focus();
+      }
+
+      function startTypedIntake() {
+        typedIntakeAnswers = {};
+        typedIntakeIndex = 0;
+        typedIntakePanel.style.display = "block";
+        renderTypedQuestion();
+      }
+
+      function cancelTypedIntake() {
+        typedIntakePanel.style.display = "none";
+        typedQuestionEl.textContent = "";
+        typedAnswerEl.value = "";
+      }
+
+      async function submitTypedIntake() {
+        const normalizedPriority = String(typedIntakeAnswers.priority || "").toLowerCase();
+        const finalPayload = {
+          requestor_name: typedIntakeAnswers.requestor_name || "Business Leader",
+          business_unit: typedIntakeAnswers.business_unit || "Lending",
+          summary: typedIntakeAnswers.summary || "Data request",
+          priority: ["low", "medium", "high", "urgent"].includes(normalizedPriority)
+            ? normalizedPriority
+            : "medium",
+          metric: typedIntakeAnswers.metric || "unspecified metric",
+          time_period: typedIntakeAnswers.time_period || "unspecified",
+          confidence: 0.9,
+          filters: {},
+          details: typedIntakeAnswers.details || "",
+          source: "typed_intake",
+        };
+
+        realtimeJsonEl.textContent = JSON.stringify(finalPayload, null, 2);
+        realtimeStatusEl.textContent = "Submitting typed intent...";
+        try {
+          await submitStructuredTicket(finalPayload);
+          realtimeStatusEl.textContent = "Typed intent submitted successfully.";
+          loadTickets();
+        } catch (error) {
+          realtimeStatusEl.textContent = `Typed intent failed: ${error.message}`;
+        }
+      }
+
+      function handleTypedNext() {
+        const current = typedIntakeQuestions[typedIntakeIndex];
+        if (!current) {
+          return;
+        }
+        const answer = String(typedAnswerEl.value || "").trim();
+        if (!answer) {
+          return;
+        }
+        typedIntakeAnswers[current.key] = answer;
+        typedIntakeIndex += 1;
+
+        if (typedIntakeIndex >= typedIntakeQuestions.length) {
+          cancelTypedIntake();
+          submitTypedIntake();
+          return;
+        }
+        renderTypedQuestion();
+      }
+
+      async function submitStructuredTicket(ticketPayload) {
+        const response = await fetch("/api/tickets", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(ticketPayload),
+        });
+        if (!response.ok) {
+          const errorBody = await response.json().catch(() => ({}));
+          throw new Error(errorBody.error || `Ticket submit failed (${response.status})`);
+        }
+        return response.json();
+      }
+
+      let currentTtsUrl = null;
+
+      // Kill any leftover browser synthesis speech from a previous page state
+      if ("speechSynthesis" in window) {
+        try { window.speechSynthesis.cancel(); } catch (_) {}
+      }
+
+      async function speakWithNaturalVoice(text, onEnd) {
+        const audio = assistantAudioEl;
+        try {
+          audio.pause();
+          audio.onended = null;
+          audio.onerror = null;
+          if (currentTtsUrl) {
+            URL.revokeObjectURL(currentTtsUrl);
+            currentTtsUrl = null;
+          }
+
+          const response = await fetch("/api/tts", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text }),
+          });
+          if (!response.ok) {
+            const body = await response.text().catch(() => "");
+            throw new Error(`TTS request failed ${response.status}: ${body}`);
+          }
+          const blob = await response.blob();
+          const url = URL.createObjectURL(blob);
+          currentTtsUrl = url;
+
+          audio.src = url;
+          audio.muted = false;
+          audio.volume = 1.0;
+          audio.onended = () => {
+            if (currentTtsUrl === url) {
+              URL.revokeObjectURL(url);
+              currentTtsUrl = null;
+            }
+            if (onEnd) onEnd();
+          };
+          audio.onerror = (e) => {
+            console.error("TTS audio playback error:", e, audio.error);
+            if (currentTtsUrl === url) {
+              URL.revokeObjectURL(url);
+              currentTtsUrl = null;
+            }
+            if (onEnd) onEnd();
+          };
+
+          const playPromise = audio.play();
+          if (playPromise && typeof playPromise.then === "function") {
+            playPromise.catch((err) => {
+              console.error("audio.play() rejected (autoplay policy?):", err);
+              realtimeStatusEl.textContent =
+                "Audio blocked by browser. Click anywhere on the page, then Start Realtime Voice again.";
+              if (onEnd) onEnd();
+            });
+          }
+        } catch (error) {
+          console.error("TTS failed:", error);
+          realtimeStatusEl.textContent = `Voice error: ${error.message}`;
+          if (onEnd) onEnd();
+        }
+      }
+
+      function askCurrentVoiceQuestion(acknowledgment = null) {
+        if (intentSubmitted) {
+          return;
+        }
+        if (voiceIntakeStep >= voiceIntakeQuestions.length) {
+          return;
+        }
+        const question = voiceIntakeQuestions[voiceIntakeStep];
+        const spoken = acknowledgment ? `${acknowledgment} ${question}` : question;
+        realtimeStatusEl.textContent = `Assistant: ${question}`;
+        realtimeJsonEl.textContent = question;
+        speakWithNaturalVoice(spoken);
+      }
+
+      async function finalizeVoiceIntake() {
+        const payload = {
+          requestor_name: voiceIntakeAnswers.requestor_name || "Business Leader",
+          business_unit: voiceIntakeAnswers.business_unit || "Unspecified",
+          summary: voiceIntakeAnswers.summary || "Unspecified request",
+          priority: "medium",
+          metric: "info_relay",
+          time_period: "unspecified",
+          confidence: 0.95,
+          filters: {},
+          details: voiceIntakeAnswers.summary || "Unspecified request",
+          source: "openai_realtime",
+        };
+
+        realtimeJsonEl.textContent = JSON.stringify(payload, null, 2);
+        realtimeStatusEl.textContent = "Submitting 3-field intake...";
+        try {
+          await submitStructuredTicket(payload);
+          intentSubmitted = true;
+          realtimeStatusEl.textContent = "Intent captured and submitted.";
+          loadTickets();
+          stopRealtime();
+        } catch (error) {
+          intentSubmitted = false;
+          realtimeStatusEl.textContent = `Ticket validation failed: ${error.message}`;
+        }
+      }
+
+      function handleRealtimeEvent(event) {
+        if (!realtimeIsActive || realtimeIsStopping || intentSubmitted) {
+          return;
+        }
+        const msg = safeJsonParse(event.data);
+        if (!msg) {
+          return;
+        }
+        console.log("RAW RESPONSE:", msg);
+        realtimeDebugEl.textContent = JSON.stringify(msg, null, 2);
+
+        if (msg.type === "conversation.item.input_audio_transcription.completed") {
+          if (intentSubmitted || finalIntentRequested || realtimeAwaitingTicket) {
+            return;
+          }
+          const rawTranscript = String(msg.transcript || "").trim();
+          const transcript = rawTranscript.toLowerCase();
+          if (!rawTranscript) {
+            return;
+          }
+          if (transcript.includes("done") || transcript.includes("stop")) {
+            if (voiceIntakeStep >= voiceIntakeQuestions.length) {
+              finalizeVoiceIntake();
+            } else {
+              realtimeStatusEl.textContent =
+                `Please answer remaining questions (${voiceIntakeStep + 1}/3 captured).`;
+              askCurrentVoiceQuestion(randomVoiceAck());
+            }
+            return;
+          }
+
+          const key = voiceIntakeKeys[voiceIntakeStep];
+          if (!key) {
+            return;
+          }
+          voiceIntakeAnswers[key] = rawTranscript;
+          voiceIntakeStep += 1;
+
+          if (voiceIntakeStep >= voiceIntakeQuestions.length) {
+            finalizeVoiceIntake();
+            return;
+          }
+
+          askCurrentVoiceQuestion(randomVoiceAck());
+          return;
+        }
+
+        if (msg.type === "input_audio_buffer.speech_started") {
+          realtimeStatusEl.textContent = "Listening...";
+          return;
+        }
+
+        if (msg.type === "input_audio_buffer.speech_stopped") {
+          if (!dataChannel || dataChannel.readyState !== "open" || realtimeAwaitingTicket || intentSubmitted) {
+            return;
+          }
+          const now = Date.now();
+          if (now - lastAutoCommitMs < 800) {
+            return;
+          }
+          lastAutoCommitMs = now;
+          realtimeStatusEl.textContent = "Processing what you said...";
+          dataChannel.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+          return;
+        }
+
+        // Realtime responses typically surface completion in response.done.
+        if (msg.type === "response.done") {
+          if (!realtimeAwaitingTicket && !realtimeAwaitingConversation) {
+            return;
+          }
+          const responseStatus = (msg.response && msg.response.status) || "";
+          const statusDetails = msg.response && msg.response.status_details;
+          const cancelReason = statusDetails && statusDetails.reason;
+          if (responseStatus === "cancelled") {
+            if (cancelReason === "turn_detected") {
+              realtimeStatusEl.textContent = "Your turn detected. Listening...";
+            } else {
+              realtimeStatusEl.textContent =
+                `Realtime response cancelled (${cancelReason || "unknown"}).`;
+            }
+            realtimeAwaitingTicket = false;
+            realtimeAwaitingConversation = false;
+            realtimeConversationInFlight = false;
+            return;
+          }
+
+          const outputs = (msg.response && msg.response.output) || [];
+          const candidateTexts = [];
+
+          for (const out of outputs) {
+            const content = out.content || [];
+            for (const part of content) {
+              if (part.text) {
+                candidateTexts.push(part.text);
+              }
+              if (part.transcript) {
+                candidateTexts.push(part.transcript);
+              }
+            }
+          }
+
+          if (msg.response && msg.response.output_text) {
+            candidateTexts.push(msg.response.output_text);
+          }
+          collectAllStringValues(msg.response, candidateTexts);
+
+          if (!candidateTexts.length) {
+            // Ignore empty/non-text responses.
+            return;
+          }
+
+          for (const candidateText of candidateTexts) {
+            const maybeTicket = extractJsonObject(candidateText);
+            if (realtimeAwaitingTicket && maybeTicket) {
+              realtimeAwaitingTicket = false;
+              realtimeJsonEl.textContent = JSON.stringify(maybeTicket, null, 2);
+              submitStructuredTicket(maybeTicket)
+                .then(() => {
+                  realtimeStatusEl.textContent =
+                    "Realtime ticket extracted and submitted to Flask.";
+                  loadTickets();
+                  intentSubmitted = true;
+                  if (finalIntentRequested) {
+                    finalIntentRequested = false;
+                    stopRealtime();
+                  }
+                })
+                .catch((error) => {
+                  realtimeStatusEl.textContent = `Ticket validation failed: ${error.message}`;
+                  finalIntentRequested = false;
+                  intentSubmitted = false;
+                });
+              return;
+            }
+          }
+
+          if (realtimeAwaitingConversation) {
+            realtimeAwaitingConversation = false;
+            realtimeConversationInFlight = false;
+            const assistantText = candidateTexts.join("\n").trim();
+            const intentReady = assistantText.includes(intentReadyMarker);
+            const cleanedAssistantText = assistantText
+              .replaceAll(intentReadyMarker, "")
+              .trim();
+            if (assistantText) {
+              realtimeStatusEl.textContent = `Assistant: ${cleanedAssistantText}`;
+              realtimeJsonEl.textContent = cleanedAssistantText;
+            } else {
+              realtimeStatusEl.textContent = "Assistant responded with audio.";
+            }
+            if (intentReady && !finalIntentRequested && !realtimeAwaitingTicket) {
+              finalIntentRequested = true;
+              realtimeStatusEl.textContent =
+                "Assistant has enough details. Generating final intent JSON...";
+              sendTicketExtractionPrompt();
+            }
+            return;
+          }
+
+          if (realtimeAwaitingTicket) {
+            realtimeStatusEl.textContent =
+              "Realtime response was not valid JSON ticket payload. See raw debug below.";
+            realtimeJsonEl.textContent = candidateTexts.slice(0, 12).join("\n\n---\n\n");
+            realtimeAwaitingTicket = false;
+          }
+        }
+      }
+
+      function sendTicketExtractionPrompt(commitAudio = true) {
+        if (
+          !dataChannel ||
+          dataChannel.readyState !== "open" ||
+          realtimeIsStopping ||
+          realtimeAwaitingTicket ||
+          intentSubmitted
+        ) {
+          return;
+        }
+        if (commitAudio) {
+          // Manual turn mode: explicitly commit captured audio before generation.
+          dataChannel.send(
+            JSON.stringify({
+              type: "input_audio_buffer.commit",
+            })
+          );
+        }
+        realtimeAwaitingTicket = true;
+        dataChannel.send(
+          JSON.stringify({
+            type: "response.create",
+            response: {
+              modalities: ["text"],
+              instructions:
+                "Convert the spoken request into one JSON object only. No prose or markdown. " +
+                'Return all keys exactly: {"requestor_name":"Business Leader","business_unit":"Lending","summary":"...","priority":"low|medium|high|urgent","metric":"...","time_period":"...","confidence":0.0,"filters":{},"details":"...","source":"openai_realtime"}',
+            },
+          })
+        );
+      }
+
+      function talkToAssistant() {
+        // Disabled: voice flow is now strict 3-question intake.
+      }
+
+      async function startRealtime() {
+        if (!mediaStream) {
+          realtimeStatusEl.textContent = "Enable camera/mic permissions first.";
+          return;
+        }
+        if (peerConnection) {
+          realtimeStatusEl.textContent = "Realtime session already active.";
+          return;
+        }
+
+        try {
+          intentSubmitted = false;
+          finalIntentRequested = false;
+          realtimeAwaitingConversation = false;
+          realtimeAwaitingTicket = false;
+          realtimeConversationInFlight = false;
+          voiceIntakeStep = 0;
+          voiceIntakeAnswers = {};
+          realtimeStatusEl.textContent = "Creating ephemeral Realtime session...";
+          const tokenResp = await fetch("/api/realtime/session", { method: "POST" });
+          if (!tokenResp.ok) {
+            throw new Error(`Session endpoint failed (${tokenResp.status})`);
+          }
+          const tokenData = await tokenResp.json();
+          const ephemeralKey = tokenData.client_secret;
+          const model = tokenData.model;
+
+          peerConnection = new RTCPeerConnection();
+          dataChannel = peerConnection.createDataChannel("oai-events");
+          dataChannel.onmessage = handleRealtimeEvent;
+          dataChannel.onopen = () => {
+            realtimeStatusEl.textContent =
+              "Realtime connected. Answer 3 questions: name, department, info to relay.";
+            dataChannel.send(
+              JSON.stringify({
+                type: "session.update",
+                session: {
+                  modalities: ["text"],
+                  turn_detection: {
+                    type: "server_vad",
+                    create_response: false,
+                    silence_duration_ms: 4500,
+                    threshold: 0.3,
+                  },
+                  input_audio_transcription: { model: "gpt-4o-mini-transcribe" },
+                },
+              })
+            );
+            realtimeStatusEl.textContent =
+              "Connected — speak naturally; I will detect when you finish.";
+            speakWithNaturalVoice(
+              "Hey! I've got just three quick questions for you. Ready when you are.",
+              () => askCurrentVoiceQuestion()
+            );
+          };
+
+          for (const track of mediaStream.getAudioTracks()) {
+            peerConnection.addTrack(track, mediaStream);
+          }
+
+          const offer = await peerConnection.createOffer();
+          await peerConnection.setLocalDescription(offer);
+
+          const sdpResponse = await fetch(`https://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${ephemeralKey}`,
+              "Content-Type": "application/sdp",
+            },
+            body: offer.sdp,
+          });
+
+          if (!sdpResponse.ok) {
+            throw new Error(`OpenAI SDP handshake failed (${sdpResponse.status})`);
+          }
+
+          const answerSdp = await sdpResponse.text();
+          await peerConnection.setRemoteDescription({ type: "answer", sdp: answerSdp });
+          realtimeIsActive = true;
+          realtimeIsStopping = false;
+          startRealtimeBtn.disabled = true;
+        } catch (error) {
+          realtimeStatusEl.textContent = `Realtime failed: ${error.message}`;
+          stopRealtime();
+        }
+      }
+
+      function stopRealtime() {
+        if ((!peerConnection && !dataChannel) || realtimeIsStopping) {
+          return;
+        }
+        realtimeIsStopping = true;
+        realtimeIsActive = false;
+        realtimeAwaitingConversation = false;
+        realtimeAwaitingTicket = false;
+        realtimeConversationInFlight = false;
+        if (dataChannel) {
+          dataChannel.onmessage = null;
+          dataChannel.close();
+        }
+        if (peerConnection) {
+          peerConnection.ontrack = null;
+          peerConnection.close();
+        }
+
+        dataChannel = null;
+        peerConnection = null;
+        startRealtimeBtn.disabled = false;
+        try {
+          assistantAudioEl.pause();
+          assistantAudioEl.onended = null;
+          assistantAudioEl.onerror = null;
+          assistantAudioEl.removeAttribute("src");
+          assistantAudioEl.load();
+        } catch (_) {}
+        if (currentTtsUrl) {
+          URL.revokeObjectURL(currentTtsUrl);
+          currentTtsUrl = null;
+        }
+        finalIntentRequested = false;
+        intentSubmitted = false;
+        realtimeIsStopping = false;
+        realtimeStatusEl.textContent = "Realtime stopped.";
+      }
+
+      function renderTickets(tickets) {
+        if (!tickets.length) {
+          ticketsEl.innerHTML = '<div class="empty">No tickets submitted yet.</div>';
+          return;
+        }
+
+        ticketsEl.innerHTML = tickets
+          .map(
+            (ticket) => `
+              <div class="card">
+                <div class="pill">${ticket.priority.toUpperCase()}</div>
+                <h3>${ticket.summary}</h3>
+                <p><strong>Requestor:</strong> ${ticket.requestor_name}</p>
+                <p><strong>Business Unit:</strong> ${ticket.business_unit}</p>
+                <p><strong>Metric:</strong> ${ticket.metric}</p>
+                <p><strong>Time Period:</strong> ${ticket.time_period}</p>
+                <p><strong>Confidence:</strong> ${ticket.confidence}</p>
+                <p><strong>Filters:</strong> ${JSON.stringify(ticket.filters || {})}</p>
+                <p><strong>Source:</strong> ${ticket.source}</p>
+                <p><strong>Created:</strong> ${ticket.created_at_utc}</p>
+                <pre>${ticket.details || "(no additional details)"}</pre>
+              </div>
+            `
+          )
+          .join("");
+      }
+
+      async function loadTickets() {
+        try {
+          const response = await fetch("/api/tickets");
+          const data = await response.json();
+          renderTickets(data.tickets || []);
+        } catch (error) {
+          ticketsEl.innerHTML = `<div class="empty">Failed to load tickets: ${error.message}</div>`;
+        }
+      }
+
+      startRealtimeBtn.addEventListener("click", startRealtime);
+      startTypedIntakeBtn.addEventListener("click", startTypedIntake);
+      typedNextBtn.addEventListener("click", handleTypedNext);
+      typedCancelBtn.addEventListener("click", cancelTypedIntake);
+      typedAnswerEl.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          handleTypedNext();
+        }
+      });
+      startDevices();
+      loadTickets();
+      setInterval(loadTickets, 3000);
+    </script>
+  </body>
+</html>
