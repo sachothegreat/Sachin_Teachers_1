@@ -50,6 +50,22 @@ def _map_metric(metric_name: str) -> str | None:
     return None
 
 
+def _post_openai(url: str, headers: dict, body: dict, timeout: int = 30):
+    """
+    Attempt OpenAI API call with env proxy settings first, then fallback to
+    direct connection if the proxy path fails.
+    """
+    last_error = None
+    for trust_env in (True, False):
+        try:
+            with requests.Session() as session:
+                session.trust_env = trust_env
+                return session.post(url, headers=headers, json=body, timeout=timeout)
+        except requests.RequestException as exc:
+            last_error = exc
+    raise last_error
+
+
 def _forward_to_cortex(ticket: dict) -> dict:
     """
     Placeholder Cortex call. Simulates a synchronous request/response.
@@ -109,22 +125,20 @@ def tts():
     voice = os.getenv("OPENAI_TTS_VOICE", "nova")
 
     try:
-        with requests.Session() as session:
-            session.trust_env = False
-            response = session.post(
-                "https://api.openai.com/v1/audio/speech",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "voice": voice,
-                    "input": text,
-                    "format": "mp3",
-                },
-                timeout=30,
-            )
+        response = _post_openai(
+            url="https://api.openai.com/v1/audio/speech",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            body={
+                "model": model,
+                "voice": voice,
+                "input": text,
+                "format": "mp3",
+            },
+            timeout=30,
+        )
     except requests.RequestException as exc:
         return _error(f"Failed to reach OpenAI TTS API: {exc}", status=502)
 
@@ -156,31 +170,28 @@ def create_realtime_session():
         return _error("OPENAI_API_KEY is not configured on the server", status=500)
 
     try:
-        # Some local environments inject HTTP(S)_PROXY values that can block
-        # direct OpenAI API calls. Disable env proxy usage for this request.
-        with requests.Session() as session:
-            session.trust_env = False
-            response = session.post(
-                "https://api.openai.com/v1/realtime/sessions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
+        response = _post_openai(
+            url="https://api.openai.com/v1/realtime/sessions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            body={
+                "model": model,
+                "modalities": ["text"],
+                "turn_detection": {
+                    "type": "server_vad",
+                    "create_response": False,
+                    "threshold": 0.6,
+                    "prefix_padding_ms": 500,
+                    "silence_duration_ms": 2000,
                 },
-                json={
-                    "model": model,
-                    "modalities": ["text"],
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "create_response": False,
-                        "silence_duration_ms": 4500,
-                        "threshold": 0.3,
-                    },
-                    "input_audio_transcription": {
-                        "model": "gpt-4o-mini-transcribe",
-                    },
+                "input_audio_transcription": {
+                    "model": "gpt-4o-mini-transcribe",
                 },
-                timeout=20,
-            )
+            },
+            timeout=20,
+        )
     except requests.RequestException as exc:
         return _error(f"Failed to reach OpenAI realtime API: {exc}", status=502)
 

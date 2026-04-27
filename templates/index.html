@@ -675,8 +675,9 @@
                   turn_detection: {
                     type: "server_vad",
                     create_response: false,
-                    silence_duration_ms: 4500,
-                    threshold: 0.3,
+                    threshold: 0.6,
+                    prefix_padding_ms: 500,
+                    silence_duration_ms: 2000,
                   },
                   input_audio_transcription: { model: "gpt-4o-mini-transcribe" },
                 },
