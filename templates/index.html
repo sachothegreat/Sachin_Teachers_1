@@ -83,6 +83,7 @@
         <p id="microphone-status" class="muted">Requesting microphone access...</p>
         <p id="realtime-status" class="muted">Realtime idle.</p>
         <button id="start-realtime">Start Realtime Voice</button>
+        <button id="stop-speaking" class="secondary" disabled>Stop & Re-ask</button>
         <button id="start-typed-intake" class="secondary">Type Intent Instead</button>
         <pre id="realtime-json" class="muted">(structured ticket preview appears here)</pre>
         <pre id="realtime-debug" class="muted">(raw realtime event debug appears here)</pre>
@@ -114,6 +115,7 @@
       const realtimeJsonEl = document.getElementById("realtime-json");
       const realtimeDebugEl = document.getElementById("realtime-debug");
       const startRealtimeBtn = document.getElementById("start-realtime");
+      const stopSpeakingBtn = document.getElementById("stop-speaking");
       const startTypedIntakeBtn = document.getElementById("start-typed-intake");
       const typedIntakePanel = document.getElementById("typed-intake-panel");
       const typedQuestionEl = document.getElementById("typed-question");
@@ -133,6 +135,9 @@
       let realtimeIsActive = false;
       let realtimeIsStopping = false;
       let lastAutoCommitMs = 0;
+      let ignoreNextSpeechStoppedCommit = false;
+      let awaitingIntroReply = false;
+      let pendingVoiceConfirmation = null;
       const intentReadyMarker = "INTENT_READY";
       const voiceIntakeQuestions = [
         "What is your name?",
@@ -145,6 +150,88 @@
       const voiceAcknowledgments = ["Got it.", "Thanks.", "Perfect.", "Nice.", "Okay."];
       function randomVoiceAck() {
         return voiceAcknowledgments[Math.floor(Math.random() * voiceAcknowledgments.length)];
+      }
+      function shortEcho(text, maxLen = 70) {
+        const normalized = String(text || "").replace(/\s+/g, " ").trim();
+        if (!normalized) return "";
+        if (normalized.length <= maxLen) return normalized;
+        return `${normalized.slice(0, maxLen - 3).trim()}...`;
+      }
+      function isRepeatRequest(transcript) {
+        return (
+          transcript.includes("repeat") ||
+          transcript.includes("say that again") ||
+          transcript.includes("what was the question") ||
+          transcript.includes("come again")
+        );
+      }
+      function isStartOverRequest(transcript) {
+        return (
+          transcript.includes("start over") ||
+          transcript.includes("restart") ||
+          transcript.includes("begin again")
+        );
+      }
+      function soundsNegativeMood(transcript) {
+        const t = String(transcript || "").toLowerCase();
+        return (
+          t.includes("not") ||
+          t.includes("n't") ||
+          t.includes("not good") ||
+          t.includes("not great") ||
+          t.includes("not okay") ||
+          t.includes("could be better") ||
+          t.includes("bad") ||
+          t.includes("bad day") ||
+          t.includes("rough day") ||
+          t.includes("terrible") ||
+          t.includes("awful") ||
+          t.includes("exhausted") ||
+          t.includes("tired") ||
+          t.includes("stressed") ||
+          t.includes("anxious") ||
+          t.includes("upset") ||
+          t.includes("sad") ||
+          t.includes("frustrated") ||
+          t.includes("not doing well")
+        );
+      }
+      function isLikelyEnglish(text) {
+        const value = String(text || "").trim();
+        if (!value) return false;
+        const letters = (value.match(/[A-Za-z]/g) || []).length;
+        const nonAscii = (value.match(/[^\x00-\x7F]/g) || []).length;
+        if (letters === 0) return false;
+        if (nonAscii > 0 && letters < 4) return false;
+        return true;
+      }
+      function getStepLabel(step) {
+        return `${Math.min(step + 1, voiceIntakeQuestions.length)}/${voiceIntakeQuestions.length}`;
+      }
+      function isYesConfirmation(transcript) {
+        const t = String(transcript || "").toLowerCase();
+        return (
+          t === "yes" ||
+          t === "yeah" ||
+          t === "yep" ||
+          t === "correct" ||
+          t === "that's right" ||
+          t === "thats right" ||
+          t.includes("yes") ||
+          t.includes("correct")
+        );
+      }
+      function isNoConfirmation(transcript) {
+        const t = String(transcript || "").toLowerCase();
+        return (
+          t === "no" ||
+          t === "nope" ||
+          t === "nah" ||
+          t === "incorrect" ||
+          t === "wrong" ||
+          t.includes("no") ||
+          t.includes("wrong")
+        );
       }
       const typedIntakeQuestions = [
         { key: "requestor_name", prompt: "What is your name?" },
@@ -396,9 +483,32 @@
         }
         const question = voiceIntakeQuestions[voiceIntakeStep];
         const spoken = acknowledgment ? `${acknowledgment} ${question}` : question;
-        realtimeStatusEl.textContent = `Assistant: ${question}`;
+        realtimeStatusEl.textContent = `Assistant (${getStepLabel(voiceIntakeStep)}): ${question}`;
         realtimeJsonEl.textContent = question;
         speakWithNaturalVoice(spoken);
+      }
+
+      function stopTalkingAndReask() {
+        if (
+          !realtimeIsActive ||
+          !dataChannel ||
+          dataChannel.readyState !== "open" ||
+          intentSubmitted ||
+          voiceIntakeStep >= voiceIntakeQuestions.length
+        ) {
+          return;
+        }
+
+        // Stop any active assistant playback and discard the in-progress user utterance.
+        try {
+          assistantAudioEl.pause();
+          assistantAudioEl.currentTime = 0;
+        } catch (_) {}
+        dataChannel.send(JSON.stringify({ type: "input_audio_buffer.clear" }));
+        ignoreNextSpeechStoppedCommit = true;
+        lastAutoCommitMs = Date.now();
+        realtimeStatusEl.textContent = "Stopped. Re-asking current question...";
+        askCurrentVoiceQuestion("No problem, let's try that again.");
       }
 
       async function finalizeVoiceIntake() {
@@ -437,6 +547,14 @@
         if (!msg) {
           return;
         }
+        if (
+          msg.type === "error" &&
+          msg.error &&
+          msg.error.code === "input_audio_buffer_commit_empty"
+        ) {
+          // Ignore noisy empty-buffer commit errors in the UI.
+          return;
+        }
         console.log("RAW RESPONSE:", msg);
         realtimeDebugEl.textContent = JSON.stringify(msg, null, 2);
 
@@ -447,6 +565,75 @@
           const rawTranscript = String(msg.transcript || "").trim();
           const transcript = rawTranscript.toLowerCase();
           if (!rawTranscript) {
+            return;
+          }
+          if (!isLikelyEnglish(rawTranscript)) {
+            realtimeStatusEl.textContent = "Please respond in English so I can capture your request accurately.";
+            askCurrentVoiceQuestion("I can only process English responses right now. Please answer in English.");
+            return;
+          }
+          if (awaitingIntroReply) {
+            awaitingIntroReply = false;
+            if (soundsNegativeMood(transcript)) {
+              realtimeStatusEl.textContent =
+                "I am sorry to hear that. We can keep this quick and easy.";
+              askCurrentVoiceQuestion(
+                "I am sorry you are having a tough day. I appreciate you sharing that. When you are ready, first question:"
+              );
+            } else {
+              realtimeStatusEl.textContent = "Nice to meet you. Let me grab your details.";
+              askCurrentVoiceQuestion("Thanks for sharing. First question:");
+            }
+            return;
+          }
+          if (pendingVoiceConfirmation) {
+            if (isYesConfirmation(transcript)) {
+              const { key, value, step } = pendingVoiceConfirmation;
+              voiceIntakeAnswers[key] = value;
+              pendingVoiceConfirmation = null;
+              voiceIntakeStep = step + 1;
+              if (voiceIntakeStep >= voiceIntakeQuestions.length) {
+                const echo = shortEcho(value);
+                if (echo) {
+                  realtimeStatusEl.textContent = `Captured (${getStepLabel(step)}): ${echo}`;
+                }
+                finalizeVoiceIntake();
+              } else {
+                askCurrentVoiceQuestion("Perfect, confirmed.");
+              }
+              return;
+            }
+            if (isNoConfirmation(transcript)) {
+              const { step } = pendingVoiceConfirmation;
+              pendingVoiceConfirmation = null;
+              realtimeStatusEl.textContent = "No problem, let's try that answer again.";
+              askCurrentVoiceQuestion(`Got it. Let's retry question ${getStepLabel(step)}.`);
+              return;
+            }
+            const pendingEcho = shortEcho(pendingVoiceConfirmation.value);
+            realtimeStatusEl.textContent =
+              "Please say yes or no so I can confirm your answer.";
+            speakWithNaturalVoice(
+              `I heard "${pendingEcho}". Is that correct? Please say yes or no.`
+            );
+            return;
+          }
+          if (isStartOverRequest(transcript)) {
+            voiceIntakeStep = 0;
+            voiceIntakeAnswers = {};
+            awaitingIntroReply = false;
+            pendingVoiceConfirmation = null;
+            realtimeStatusEl.textContent = "Starting over from question 1.";
+            askCurrentVoiceQuestion("No problem, let's restart.");
+            return;
+          }
+          if (isRepeatRequest(transcript)) {
+            realtimeStatusEl.textContent = "Repeating your current question.";
+            askCurrentVoiceQuestion("Sure, here's that question again.");
+            return;
+          }
+          if (rawTranscript.length < 2) {
+            askCurrentVoiceQuestion("I didn't quite catch that.");
             return;
           }
           if (transcript.includes("done") || transcript.includes("stop")) {
@@ -460,19 +647,17 @@
             return;
           }
 
-          const key = voiceIntakeKeys[voiceIntakeStep];
+          const step = voiceIntakeStep;
+          const key = voiceIntakeKeys[step];
           if (!key) {
             return;
           }
-          voiceIntakeAnswers[key] = rawTranscript;
-          voiceIntakeStep += 1;
-
-          if (voiceIntakeStep >= voiceIntakeQuestions.length) {
-            finalizeVoiceIntake();
-            return;
-          }
-
-          askCurrentVoiceQuestion(randomVoiceAck());
+          pendingVoiceConfirmation = { key, value: rawTranscript, step };
+          const echo = shortEcho(rawTranscript);
+          realtimeStatusEl.textContent = `Confirming (${getStepLabel(step)}): ${echo}`;
+          speakWithNaturalVoice(
+            `I heard "${echo}". Is that correct? Please say yes or no.`
+          );
           return;
         }
 
@@ -483,6 +668,10 @@
 
         if (msg.type === "input_audio_buffer.speech_stopped") {
           if (!dataChannel || dataChannel.readyState !== "open" || realtimeAwaitingTicket || intentSubmitted) {
+            return;
+          }
+          if (ignoreNextSpeechStoppedCommit) {
+            ignoreNextSpeechStoppedCommit = false;
             return;
           }
           const now = Date.now();
@@ -652,6 +841,8 @@
           realtimeConversationInFlight = false;
           voiceIntakeStep = 0;
           voiceIntakeAnswers = {};
+          awaitingIntroReply = true;
+          pendingVoiceConfirmation = null;
           realtimeStatusEl.textContent = "Creating ephemeral Realtime session...";
           const tokenResp = await fetch("/api/realtime/session", { method: "POST" });
           if (!tokenResp.ok) {
@@ -672,6 +863,8 @@
                 type: "session.update",
                 session: {
                   modalities: ["text"],
+                  instructions:
+                    "Use English only. Ask follow-up questions in English. If the user speaks a different language, politely ask them to continue in English.",
                   turn_detection: {
                     type: "server_vad",
                     create_response: false,
@@ -679,15 +872,14 @@
                     prefix_padding_ms: 500,
                     silence_duration_ms: 2000,
                   },
-                  input_audio_transcription: { model: "gpt-4o-mini-transcribe" },
+                  input_audio_transcription: { model: "gpt-4o-mini-transcribe", language: "en" },
                 },
               })
             );
             realtimeStatusEl.textContent =
               "Connected — speak naturally; I will detect when you finish.";
             speakWithNaturalVoice(
-              "Hey! I've got just three quick questions for you. Ready when you are.",
-              () => askCurrentVoiceQuestion()
+              "Hey! I've got just three quick questions for you, and before we start, how are you doing today?"
             );
           };
 
@@ -716,6 +908,7 @@
           realtimeIsActive = true;
           realtimeIsStopping = false;
           startRealtimeBtn.disabled = true;
+          stopSpeakingBtn.disabled = false;
         } catch (error) {
           realtimeStatusEl.textContent = `Realtime failed: ${error.message}`;
           stopRealtime();
@@ -743,6 +936,7 @@
         dataChannel = null;
         peerConnection = null;
         startRealtimeBtn.disabled = false;
+        stopSpeakingBtn.disabled = true;
         try {
           assistantAudioEl.pause();
           assistantAudioEl.onended = null;
@@ -756,6 +950,8 @@
         }
         finalIntentRequested = false;
         intentSubmitted = false;
+        awaitingIntroReply = false;
+        pendingVoiceConfirmation = null;
         realtimeIsStopping = false;
         realtimeStatusEl.textContent = "Realtime stopped.";
       }
@@ -798,6 +994,7 @@
       }
 
       startRealtimeBtn.addEventListener("click", startRealtime);
+      stopSpeakingBtn.addEventListener("click", stopTalkingAndReask);
       startTypedIntakeBtn.addEventListener("click", startTypedIntake);
       typedNextBtn.addEventListener("click", handleTypedNext);
       typedCancelBtn.addEventListener("click", cancelTypedIntake);
