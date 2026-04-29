@@ -196,6 +196,18 @@
           t.includes("not doing well")
         );
       }
+      function soundsPositiveMood(transcript) {
+        const t = String(transcript || "").toLowerCase();
+        return (
+          t.includes("good") ||
+          t.includes("great") ||
+          t.includes("fine") ||
+          t.includes("doing well") ||
+          t.includes("pretty well") ||
+          t.includes("awesome") ||
+          t.includes("amazing")
+        );
+      }
       function isLikelyEnglish(text) {
         const value = String(text || "").trim();
         if (!value) return false;
@@ -577,12 +589,22 @@
             if (soundsNegativeMood(transcript)) {
               realtimeStatusEl.textContent =
                 "I am sorry to hear that. We can keep this quick and easy.";
-              askCurrentVoiceQuestion(
-                "I am sorry you are having a tough day. I appreciate you sharing that. When you are ready, first question:"
+              speakWithNaturalVoice(
+                "I am sorry you are having a tough day. I appreciate you sharing that.",
+                () => askCurrentVoiceQuestion("When you are ready, first question:")
+              );
+            } else if (soundsPositiveMood(transcript)) {
+              realtimeStatusEl.textContent = "Glad to hear you're doing well.";
+              speakWithNaturalVoice(
+                "That is great to hear, thanks for sharing.",
+                () => askCurrentVoiceQuestion("Awesome. First question:")
               );
             } else {
               realtimeStatusEl.textContent = "Nice to meet you. Let me grab your details.";
-              askCurrentVoiceQuestion("Thanks for sharing. First question:");
+              speakWithNaturalVoice(
+                "Thanks for sharing that with me.",
+                () => askCurrentVoiceQuestion("First question:")
+              );
             }
             return;
           }
