@@ -172,42 +172,6 @@
           transcript.includes("begin again")
         );
       }
-      function soundsNegativeMood(transcript) {
-        const t = String(transcript || "").toLowerCase();
-        return (
-          t.includes("not") ||
-          t.includes("n't") ||
-          t.includes("not good") ||
-          t.includes("not great") ||
-          t.includes("not okay") ||
-          t.includes("could be better") ||
-          t.includes("bad") ||
-          t.includes("bad day") ||
-          t.includes("rough day") ||
-          t.includes("terrible") ||
-          t.includes("awful") ||
-          t.includes("exhausted") ||
-          t.includes("tired") ||
-          t.includes("stressed") ||
-          t.includes("anxious") ||
-          t.includes("upset") ||
-          t.includes("sad") ||
-          t.includes("frustrated") ||
-          t.includes("not doing well")
-        );
-      }
-      function soundsPositiveMood(transcript) {
-        const t = String(transcript || "").toLowerCase();
-        return (
-          t.includes("good") ||
-          t.includes("great") ||
-          t.includes("fine") ||
-          t.includes("doing well") ||
-          t.includes("pretty well") ||
-          t.includes("awesome") ||
-          t.includes("amazing")
-        );
-      }
       function isLikelyEnglish(text) {
         const value = String(text || "").trim();
         if (!value) return false;
@@ -420,6 +384,20 @@
         return response.json();
       }
 
+      async function fetchIntroAcknowledgment(userText) {
+        const response = await fetch("/api/mood-response", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: userText }),
+        });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.error || `Mood response failed (${response.status})`);
+        }
+        const data = await response.json();
+        return String(data.acknowledgment || "").trim();
+      }
+
       let currentTtsUrl = null;
 
       // Kill any leftover browser synthesis speech from a previous page state
@@ -551,7 +529,7 @@
         }
       }
 
-      function handleRealtimeEvent(event) {
+      async function handleRealtimeEvent(event) {
         if (!realtimeIsActive || realtimeIsStopping || intentSubmitted) {
           return;
         }
@@ -586,26 +564,17 @@
           }
           if (awaitingIntroReply) {
             awaitingIntroReply = false;
-            if (soundsNegativeMood(transcript)) {
-              realtimeStatusEl.textContent =
-                "I am sorry to hear that. We can keep this quick and easy.";
-              speakWithNaturalVoice(
-                "I am sorry you are having a tough day. I appreciate you sharing that.",
-                () => askCurrentVoiceQuestion("When you are ready, first question:")
-              );
-            } else if (soundsPositiveMood(transcript)) {
-              realtimeStatusEl.textContent = "Glad to hear you're doing well.";
-              speakWithNaturalVoice(
-                "That is great to hear, thanks for sharing.",
-                () => askCurrentVoiceQuestion("Awesome. First question:")
-              );
-            } else {
-              realtimeStatusEl.textContent = "Nice to meet you. Let me grab your details.";
-              speakWithNaturalVoice(
-                "Thanks for sharing that with me.",
-                () => askCurrentVoiceQuestion("First question:")
-              );
+            realtimeStatusEl.textContent = "Thanks for sharing. Let me respond.";
+            let acknowledgment = "Thanks for sharing that with me.";
+            try {
+              const generated = await fetchIntroAcknowledgment(rawTranscript);
+              if (generated) {
+                acknowledgment = generated;
+              }
+            } catch (error) {
+              console.error("Mood response fallback:", error);
             }
+            speakWithNaturalVoice(acknowledgment, () => askCurrentVoiceQuestion("First question:"));
             return;
           }
           if (pendingVoiceConfirmation) {

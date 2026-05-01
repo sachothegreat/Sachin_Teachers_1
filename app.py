@@ -66,6 +66,30 @@ def _post_openai(url: str, headers: dict, body: dict, timeout: int = 30):
     raise last_error
 
 
+def _extract_response_text(data: dict) -> str:
+    if not isinstance(data, dict):
+        return ""
+    output_text = data.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    outputs = data.get("output")
+    if isinstance(outputs, list):
+        for item in outputs:
+            if not isinstance(item, dict):
+                continue
+            contents = item.get("content")
+            if not isinstance(contents, list):
+                continue
+            for part in contents:
+                if not isinstance(part, dict):
+                    continue
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+    return ""
+
+
 def _forward_to_cortex(ticket: dict) -> dict:
     """
     Placeholder Cortex call. Simulates a synchronous request/response.
@@ -218,6 +242,76 @@ def create_realtime_session():
             "model": model,
         }
     )
+
+
+@app.post("/api/mood-response")
+def mood_response():
+    """
+    Generate a short, empathetic acknowledgment to the user's mood check-in.
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return _error("OPENAI_API_KEY is not configured on the server", status=500)
+
+    payload = request.get_json(silent=True) or {}
+    user_text = _sanitize_text(str(payload.get("text", "")))
+    if not user_text:
+        return _error("text is required")
+
+    model = os.getenv("OPENAI_TEXT_MODEL", "gpt-4.1-mini")
+    try:
+        response = _post_openai(
+            url="https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            body={
+                "model": model,
+                "input": [
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "You are a professional voice assistant for business users. "
+                                    "Write one short English empathy acknowledgment to the user's mood check-in. "
+                                    "Be warm, concise, and supportive. No emojis. Max 20 words."
+                                ),
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": user_text}],
+                    },
+                ],
+                "max_output_tokens": 60,
+            },
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return _error(f"Failed to reach OpenAI response API: {exc}", status=502)
+
+    if not response.ok:
+        return (
+            jsonify(
+                {
+                    "error": "OpenAI mood response generation failed",
+                    "status_code": response.status_code,
+                    "details": response.text,
+                }
+            ),
+            502,
+        )
+
+    data = response.json()
+    acknowledgment = _extract_response_text(data)
+    if not acknowledgment:
+        acknowledgment = "Thanks for sharing that. I appreciate it."
+
+    return jsonify({"acknowledgment": acknowledgment})
 
 
 @app.post("/api/tickets")
