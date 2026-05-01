@@ -277,7 +277,8 @@ def mood_response():
                                 "text": (
                                     "You are a professional voice assistant for business users. "
                                     "Write one short English empathy acknowledgment to the user's mood check-in. "
-                                    "Be warm, concise, and supportive. No emojis. Max 20 words."
+                                    "Be warm, concise, and supportive. Do not ask any follow-up question. "
+                                    "No emojis. Max 20 words."
                                 ),
                             }
                         ],
