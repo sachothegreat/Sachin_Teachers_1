@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -88,6 +89,18 @@ def _extract_response_text(data: dict) -> str:
                 if isinstance(text, str) and text.strip():
                     return text.strip()
     return ""
+
+
+def _extract_first_int(text: str) -> int | None:
+    if not isinstance(text, str):
+        return None
+    match = re.search(r"\d+", text)
+    if not match:
+        return None
+    try:
+        return int(match.group(0))
+    except ValueError:
+        return None
 
 
 def _forward_to_cortex(ticket: dict) -> dict:
@@ -313,6 +326,79 @@ def mood_response():
         acknowledgment = "Thanks for sharing that. I appreciate it."
 
     return jsonify({"acknowledgment": acknowledgment})
+
+
+@app.post("/api/presence-check")
+def presence_check():
+    """
+    Estimate how many people are visible in a camera frame.
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return _error("OPENAI_API_KEY is not configured on the server", status=500)
+
+    payload = request.get_json(silent=True) or {}
+    image_data_url = str(payload.get("image_data_url", "")).strip()
+    if not image_data_url:
+        return _error("image_data_url is required")
+
+    model = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini")
+    try:
+        response = _post_openai(
+            url="https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            body={
+                "model": model,
+                "input": [
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "Count how many real human people are visible in this image frame. "
+                                    "Return only one integer (0,1,2...). No words."
+                                ),
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "How many people are visible?"},
+                            {"type": "input_image", "image_url": image_data_url},
+                        ],
+                    },
+                ],
+                "max_output_tokens": 16,
+            },
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return _error(f"Failed to reach OpenAI vision API: {exc}", status=502)
+
+    if not response.ok:
+        return (
+            jsonify(
+                {
+                    "error": "OpenAI presence check failed",
+                    "status_code": response.status_code,
+                    "details": response.text,
+                }
+            ),
+            502,
+        )
+
+    data = response.json()
+    raw_text = _extract_response_text(data)
+    people_count = _extract_first_int(raw_text)
+    if people_count is None:
+        return _error("Could not parse people count from vision response", status=502)
+
+    return jsonify({"people_count": max(0, people_count)})
 
 
 @app.post("/api/tickets")

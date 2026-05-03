@@ -81,6 +81,7 @@
         <h3>Device Access</h3>
         <p id="camera-status" class="muted">Requesting camera access...</p>
         <p id="microphone-status" class="muted">Requesting microphone access...</p>
+        <p id="presence-status" class="muted">Presence check: initializing...</p>
         <p id="realtime-status" class="muted">Realtime idle.</p>
         <button id="start-realtime">Start Realtime Voice</button>
         <button id="stop-speaking" class="secondary" disabled>Stop & Re-ask</button>
@@ -111,6 +112,7 @@
       const ticketsEl = document.getElementById("tickets");
       const cameraStatusEl = document.getElementById("camera-status");
       const microphoneStatusEl = document.getElementById("microphone-status");
+      const presenceStatusEl = document.getElementById("presence-status");
       const realtimeStatusEl = document.getElementById("realtime-status");
       const realtimeJsonEl = document.getElementById("realtime-json");
       const realtimeDebugEl = document.getElementById("realtime-debug");
@@ -138,6 +140,17 @@
       let ignoreNextSpeechStoppedCommit = false;
       let awaitingIntroReply = false;
       let pendingVoiceConfirmation = null;
+      let faceDetector = null;
+      let presenceCheckTimer = null;
+      let currentFaceCount = null;
+      let multiPersonBlocked = false;
+      let consecutiveMultiFaceDetections = 0;
+      let presenceApiInFlight = false;
+      let presenceMode = "uninitialized";
+      let presenceCanvas = null;
+      let presenceCanvasCtx = null;
+      const FACE_CHECK_INTERVAL_MS = 1200;
+      const MULTI_FACE_CONFIRMATION_THRESHOLD = 2;
       const intentReadyMarker = "INTENT_READY";
       const voiceIntakeQuestions = [
         "What is your name?",
@@ -225,6 +238,7 @@
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
           cameraStatusEl.textContent = "Camera API not supported in this browser.";
           microphoneStatusEl.textContent = "Microphone API not supported in this browser.";
+          presenceStatusEl.textContent = "Presence check unavailable.";
           return;
         }
 
@@ -237,9 +251,169 @@
           mediaStream = stream;
           cameraStatusEl.textContent = "Camera is on.";
           microphoneStatusEl.textContent = "Microphone is on.";
+          initializePresenceCheck();
         } catch (error) {
           cameraStatusEl.textContent = `Camera access blocked: ${error.message}`;
           microphoneStatusEl.textContent = `Microphone access blocked: ${error.message}`;
+          presenceStatusEl.textContent = "Presence check unavailable.";
+        }
+      }
+
+      function updatePresenceUI() {
+        if (presenceMode === "api") {
+          presenceStatusEl.textContent =
+            currentFaceCount == null
+              ? "Presence check: scanning (API mode)..."
+              : `Presence check (${multiPersonBlocked ? "blocked" : "API"}): ${
+                  currentFaceCount === 1
+                    ? "one person detected."
+                    : `${currentFaceCount} people detected.`
+                }`;
+          if (multiPersonBlocked) {
+            presenceStatusEl.textContent = `Presence check: ${currentFaceCount} people detected. Keep only one person in frame.`;
+          }
+          return;
+        }
+        if (!faceDetector) {
+          presenceStatusEl.textContent = "Presence check unavailable in this browser.";
+          return;
+        }
+        if (currentFaceCount == null) {
+          presenceStatusEl.textContent = "Presence check: scanning...";
+          return;
+        }
+        if (multiPersonBlocked) {
+          presenceStatusEl.textContent = `Presence check: ${currentFaceCount} people detected. Keep only one person in frame.`;
+          return;
+        }
+        if (currentFaceCount === 0) {
+          presenceStatusEl.textContent = "Presence check: no face detected.";
+          return;
+        }
+        if (currentFaceCount === 1) {
+          presenceStatusEl.textContent = "Presence check: one person detected.";
+          return;
+        }
+        presenceStatusEl.textContent = `Presence check: ${currentFaceCount} people detected.`;
+      }
+
+      async function runPresenceCheck() {
+        if (!cameraPreviewEl || cameraPreviewEl.readyState < 2) {
+          return;
+        }
+        try {
+          if (presenceMode === "local" && faceDetector) {
+            const faces = await faceDetector.detect(cameraPreviewEl);
+            currentFaceCount = Array.isArray(faces) ? faces.length : 0;
+          } else if (presenceMode === "api") {
+            const peopleCount = await detectPeopleCountViaApi();
+            if (typeof peopleCount === "number") {
+              currentFaceCount = peopleCount;
+            } else {
+              return;
+            }
+          } else {
+            return;
+          }
+          if (currentFaceCount > 1) {
+            consecutiveMultiFaceDetections += 1;
+          } else {
+            consecutiveMultiFaceDetections = 0;
+          }
+          multiPersonBlocked = consecutiveMultiFaceDetections >= MULTI_FACE_CONFIRMATION_THRESHOLD;
+          updatePresenceUI();
+
+          if (multiPersonBlocked && realtimeIsActive) {
+            stopRealtime("Realtime stopped: more than one person detected in camera view.");
+          }
+        } catch (error) {
+          presenceStatusEl.textContent = "Presence check error. Continuing without auto-block.";
+        }
+      }
+
+      function getPresenceFrameDataUrl() {
+        if (!cameraPreviewEl || cameraPreviewEl.readyState < 2) {
+          return null;
+        }
+        const width = cameraPreviewEl.videoWidth || 640;
+        const height = cameraPreviewEl.videoHeight || 480;
+        if (!presenceCanvas) {
+          presenceCanvas = document.createElement("canvas");
+          presenceCanvasCtx = presenceCanvas.getContext("2d");
+        }
+        presenceCanvas.width = width;
+        presenceCanvas.height = height;
+        if (!presenceCanvasCtx) {
+          return null;
+        }
+        presenceCanvasCtx.drawImage(cameraPreviewEl, 0, 0, width, height);
+        return presenceCanvas.toDataURL("image/jpeg", 0.6);
+      }
+
+      async function detectPeopleCountViaApi() {
+        if (presenceApiInFlight) {
+          return null;
+        }
+        const imageDataUrl = getPresenceFrameDataUrl();
+        if (!imageDataUrl) {
+          return null;
+        }
+        presenceApiInFlight = true;
+        try {
+          const response = await fetch("/api/presence-check", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ image_data_url: imageDataUrl }),
+          });
+          if (!response.ok) {
+            return null;
+          }
+          const data = await response.json();
+          const peopleCount = Number(data.people_count);
+          if (!Number.isFinite(peopleCount)) {
+            return null;
+          }
+          return Math.max(0, Math.floor(peopleCount));
+        } catch (error) {
+          return null;
+        } finally {
+          presenceApiInFlight = false;
+        }
+      }
+
+      function initializePresenceCheck() {
+        if (typeof window.FaceDetector !== "function") {
+          presenceMode = "api";
+          faceDetector = null;
+          updatePresenceUI();
+          if (presenceCheckTimer) {
+            clearInterval(presenceCheckTimer);
+          }
+          presenceCheckTimer = setInterval(runPresenceCheck, FACE_CHECK_INTERVAL_MS);
+          runPresenceCheck();
+          return;
+        }
+        try {
+          faceDetector = new window.FaceDetector({
+            maxDetectedFaces: 5,
+            fastMode: true,
+          });
+          presenceMode = "local";
+          updatePresenceUI();
+          if (presenceCheckTimer) {
+            clearInterval(presenceCheckTimer);
+          }
+          presenceCheckTimer = setInterval(runPresenceCheck, FACE_CHECK_INTERVAL_MS);
+          runPresenceCheck();
+        } catch (error) {
+          presenceMode = "api";
+          faceDetector = null;
+          updatePresenceUI();
+          if (presenceCheckTimer) {
+            clearInterval(presenceCheckTimer);
+          }
+          presenceCheckTimer = setInterval(runPresenceCheck, FACE_CHECK_INTERVAL_MS);
+          runPresenceCheck();
         }
       }
 
@@ -819,6 +993,10 @@
           realtimeStatusEl.textContent = "Enable camera/mic permissions first.";
           return;
         }
+        if (multiPersonBlocked) {
+          realtimeStatusEl.textContent = "Cannot start: more than one person detected on camera.";
+          return;
+        }
         if (peerConnection) {
           realtimeStatusEl.textContent = "Realtime session already active.";
           return;
@@ -906,7 +1084,7 @@
         }
       }
 
-      function stopRealtime() {
+      function stopRealtime(reason = "Realtime stopped.") {
         if ((!peerConnection && !dataChannel) || realtimeIsStopping) {
           return;
         }
@@ -944,7 +1122,7 @@
         awaitingIntroReply = false;
         pendingVoiceConfirmation = null;
         realtimeIsStopping = false;
-        realtimeStatusEl.textContent = "Realtime stopped.";
+        realtimeStatusEl.textContent = reason;
       }
 
       function renderTickets(tickets) {
