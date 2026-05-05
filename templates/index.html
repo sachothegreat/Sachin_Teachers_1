@@ -3,109 +3,579 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>TFCU Voice Ticket Intake</title>
+    <title>Teachers FCU — Voice ticket intake</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
     <style>
-      body {
-        font-family: Arial, sans-serif;
-        background: #0f172a;
-        color: #e2e8f0;
-        margin: 0;
+      :root {
+        --bg-deep: #070b14;
+        --bg: #0c1222;
+        --bg-elevated: #111827;
+        --bg-card: #151d2e;
+        --border: rgba(148, 163, 184, 0.18);
+        --border-strong: rgba(148, 163, 184, 0.28);
+        --text: #f1f5f9;
+        --muted: #94a3b8;
+        --accent: #38bdf8;
+        --accent-dim: rgba(56, 189, 248, 0.12);
+        --primary: #0ea5e9;
+        --primary-hover: #0284c7;
+        --secondary: #334155;
+        --secondary-hover: #475569;
+        --radius: 14px;
+        --radius-sm: 10px;
+        --shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+        --font: "DM Sans", system-ui, -apple-system, sans-serif;
+        --mono: "JetBrains Mono", ui-monospace, monospace;
       }
+
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family: var(--font);
+        background: var(--bg-deep);
+        background-image: radial-gradient(ellipse 120% 80% at 50% -30%, rgba(14, 165, 233, 0.14), transparent),
+          radial-gradient(ellipse 70% 50% at 100% 0%, rgba(56, 189, 248, 0.06), transparent);
+        color: var(--text);
+        margin: 0;
+        line-height: 1.5;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      .app-shell {
+        display: flex;
+        align-items: stretch;
+        min-height: 100vh;
+      }
+
+      .main {
+        flex: 1;
+        min-width: 0;
+        padding: clamp(20px, 4vw, 40px);
+        max-width: 980px;
+      }
+
+      .page-header {
+        margin-bottom: 28px;
+      }
+
+      .page-header-brand-row {
+        display: flex;
+        align-items: center;
+        gap: clamp(14px, 3vw, 24px);
+        margin-bottom: 6px;
+      }
+
+      .brand-photo-wrap {
+        flex-shrink: 0;
+        line-height: 0;
+        background: #ffffff;
+        border-radius: 14px;
+        padding: 10px 16px;
+        border: 1px solid var(--border-strong);
+        box-shadow: 0 10px 32px rgba(0, 0, 0, 0.35);
+      }
+
+      .brand-photo {
+        display: block;
+        width: clamp(168px, 36vw, 300px);
+        height: auto;
+        max-height: 52px;
+        object-fit: contain;
+        object-position: left center;
+      }
+
+      .page-header-text {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .page-header h1 {
+        font-size: clamp(1.5rem, 4vw, 2rem);
+        font-weight: 700;
+        letter-spacing: -0.03em;
+        margin: 0 0 10px;
+        line-height: 1.2;
+      }
+
+      .page-header h1 span {
+        color: var(--accent);
+        font-weight: 600;
+      }
+
+      .page-header .lede {
+        font-size: 1rem;
+        color: var(--muted);
+        margin: 0 0 8px;
+        max-width: 52ch;
+      }
+
+      .muted {
+        color: var(--muted);
+      }
+
       .container {
         max-width: 920px;
-        margin: 0 auto;
-        padding: 24px;
+        margin: 0;
+        padding: 0;
       }
+
       .card {
-        background: #1e293b;
-        border: 1px solid #334155;
-        border-radius: 10px;
-        padding: 16px;
-        margin-bottom: 14px;
+        background: linear-gradient(165deg, rgba(30, 41, 59, 0.65) 0%, rgba(15, 23, 42, 0.85) 100%);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: clamp(18px, 3vw, 22px);
+        margin-bottom: 18px;
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(8px);
       }
-      .pill {
-        display: inline-block;
-        font-size: 12px;
-        border-radius: 999px;
-        padding: 4px 10px;
-        border: 1px solid #64748b;
-        color: #93c5fd;
+
+      .card h3 {
+        margin: 0 0 14px;
+        font-size: 1.05rem;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+        color: var(--text);
       }
-      .muted {
-        color: #94a3b8;
+
+      .card-inset {
+        background: rgba(2, 6, 23, 0.45);
+        border-color: var(--border);
+        box-shadow: none;
+        margin-top: 16px;
+        margin-bottom: 0;
       }
-      pre {
-        white-space: pre-wrap;
-        word-break: break-word;
+
+      .callout {
+        font-size: 0.8125rem;
+        line-height: 1.55;
+        padding: 12px 14px;
+        border-radius: var(--radius-sm);
+        background: var(--accent-dim);
+        border: 1px solid rgba(56, 189, 248, 0.22);
+        margin-bottom: 16px;
       }
-      .empty {
-        border: 1px dashed #475569;
-        border-radius: 10px;
-        padding: 16px;
+
+      .callout strong {
+        color: #bae6fd;
+        font-weight: 600;
       }
+
+      .status-grid {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-bottom: 18px;
+      }
+
+      .status-grid p {
+        margin: 0;
+        font-size: 0.875rem;
+        padding: 8px 12px;
+        border-radius: 8px;
+        background: rgba(15, 23, 42, 0.6);
+        border: 1px solid var(--border);
+      }
+
+      .btn-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-bottom: 16px;
+      }
+
       button {
-        background: #2563eb;
+        font-family: var(--font);
+        font-weight: 600;
+        font-size: 0.875rem;
+        background: linear-gradient(180deg, var(--primary) 0%, #0284c7 100%);
         border: none;
         color: #fff;
-        padding: 10px 14px;
-        border-radius: 8px;
+        padding: 11px 18px;
+        border-radius: 10px;
         cursor: pointer;
-        margin-right: 8px;
+        box-shadow: 0 2px 12px rgba(14, 165, 233, 0.25);
+        transition: transform 0.12s ease, box-shadow 0.12s ease, filter 0.12s ease;
       }
+
+      button:hover:not(:disabled) {
+        filter: brightness(1.06);
+        box-shadow: 0 4px 18px rgba(14, 165, 233, 0.35);
+      }
+
+      button:active:not(:disabled) {
+        transform: translateY(1px);
+      }
+
       button.secondary {
-        background: #475569;
+        background: var(--secondary);
+        box-shadow: none;
       }
+
+      button.secondary:hover:not(:disabled) {
+        background: var(--secondary-hover);
+      }
+
       button:disabled {
-        opacity: 0.6;
+        opacity: 0.45;
         cursor: not-allowed;
+        box-shadow: none;
       }
+
+      .panel-pre {
+        font-family: var(--mono);
+        font-size: 0.75rem;
+        line-height: 1.45;
+        white-space: pre-wrap;
+        word-break: break-word;
+        background: rgba(2, 6, 23, 0.55);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        padding: 12px 14px;
+        margin: 0 0 10px;
+        color: #cbd5e1;
+        max-height: 140px;
+        overflow: auto;
+      }
+
+      .form-input {
+        width: 100%;
+        font-family: var(--font);
+        font-size: 0.9375rem;
+        padding: 12px 14px;
+        border-radius: 10px;
+        border: 1px solid var(--border-strong);
+        background: rgba(2, 6, 23, 0.65);
+        color: var(--text);
+        outline: none;
+        transition: border-color 0.15s ease, box-shadow 0.15s ease;
+      }
+
+      .form-input::placeholder {
+        color: #64748b;
+      }
+
+      .form-input:focus {
+        border-color: rgba(56, 189, 248, 0.45);
+        box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.12);
+      }
+
+      .mt {
+        margin-top: 12px;
+      }
+
       video {
         width: 100%;
         max-width: 420px;
-        border-radius: 10px;
-        border: 1px solid #334155;
+        border-radius: var(--radius-sm);
+        border: 1px solid var(--border-strong);
         background: #020617;
+        box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+      }
+
+      .pill {
+        display: inline-block;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        border-radius: 999px;
+        padding: 5px 11px;
+        border: 1px solid var(--border-strong);
+        color: #bae6fd;
+        background: rgba(56, 189, 248, 0.08);
+      }
+
+      .pill-urgent,
+      .pill-high {
+        color: #fecaca;
+        border-color: rgba(248, 113, 113, 0.35);
+        background: rgba(239, 68, 68, 0.12);
+      }
+
+      .pill-medium,
+      .pill-med {
+        color: #fde68a;
+        border-color: rgba(251, 191, 36, 0.3);
+        background: rgba(245, 158, 11, 0.1);
+      }
+
+      .pill-low {
+        color: #bbf7d0;
+        border-color: rgba(74, 222, 128, 0.28);
+        background: rgba(34, 197, 94, 0.1);
+      }
+
+      pre {
+        font-family: var(--mono);
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .empty {
+        border: 1px dashed var(--border-strong);
+        border-radius: var(--radius-sm);
+        padding: 20px 16px;
+        text-align: center;
+        font-size: 0.875rem;
+        color: var(--muted);
+        background: rgba(15, 23, 42, 0.35);
+      }
+
+      .tickets-rail {
+        width: min(380px, 38vw);
+        flex-shrink: 0;
+        background: linear-gradient(180deg, #050810 0%, #0a0f1a 40%, #060a12 100%);
+        border-left: 1px solid var(--border);
+        display: flex;
+        flex-direction: column;
+        position: sticky;
+        top: 0;
+        align-self: flex-start;
+        height: 100vh;
+        min-height: 0;
+        box-shadow: -12px 0 40px rgba(0, 0, 0, 0.25);
+      }
+
+      .tickets-rail-header {
+        flex-shrink: 0;
+        padding: 22px 20px 16px;
+        border-bottom: 1px solid var(--border);
+        background: rgba(5, 8, 16, 0.85);
+        backdrop-filter: blur(10px);
+        z-index: 1;
+      }
+
+      .tickets-rail-header h2 {
+        margin: 0;
+        font-size: 1rem;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        color: var(--text);
+      }
+
+      .tickets-rail-header .muted {
+        margin: 6px 0 0;
+        font-size: 12px;
+      }
+
+      #tickets {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        overflow-x: hidden;
+        padding: 14px 16px 28px;
+        scroll-snap-type: y proximity;
+        -webkit-overflow-scrolling: touch;
+      }
+
+      #tickets::-webkit-scrollbar {
+        width: 8px;
+      }
+
+      #tickets::-webkit-scrollbar-track {
+        background: transparent;
+      }
+
+      #tickets::-webkit-scrollbar-thumb {
+        background: rgba(148, 163, 184, 0.25);
+        border-radius: 99px;
+      }
+
+      #tickets .ticket-card {
+        scroll-snap-align: start;
+        margin-bottom: 14px;
+        padding: 16px;
+      }
+
+      #tickets .ticket-card:last-child {
+        margin-bottom: 0;
+      }
+
+      .ticket-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 12px;
+      }
+
+      .ticket-time {
+        font-size: 10px;
+        font-family: var(--mono);
+        color: #64748b;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 55%;
+      }
+
+      .ticket-title {
+        font-size: 0.95rem;
+        font-weight: 600;
+        line-height: 1.35;
+        margin: 0 0 14px;
+        letter-spacing: -0.02em;
+        color: #f8fafc;
+      }
+
+      .ticket-fields {
+        display: grid;
+        grid-template-columns: 6.5rem 1fr;
+        gap: 6px 10px;
+        font-size: 0.8125rem;
+        margin-bottom: 12px;
+      }
+
+      .ticket-fields .tf-label {
+        color: #64748b;
+        font-weight: 500;
+      }
+
+      .ticket-fields .tf-val {
+        color: #cbd5e1;
+        word-break: break-word;
+      }
+
+      .ticket-pre {
+        font-family: var(--mono);
+        font-size: 0.7rem;
+        line-height: 1.45;
+        margin: 0;
+        padding: 10px 12px;
+        border-radius: 8px;
+        background: rgba(2, 6, 23, 0.65);
+        border: 1px solid var(--border);
+        color: #94a3b8;
+        max-height: 120px;
+        overflow: auto;
+      }
+
+      @media (max-width: 800px) {
+        .app-shell {
+          flex-direction: column;
+        }
+
+        .tickets-rail {
+          width: 100%;
+          height: auto;
+          max-height: 44vh;
+          position: relative;
+          border-left: none;
+          border-top: 1px solid var(--border);
+          box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.2);
+        }
+
+        #tickets {
+          max-height: 36vh;
+        }
       }
     </style>
   </head>
   <body>
-    <div class="container">
-      <h1>TFCU Voice Ticket Intake</h1>
-      <p class="muted">
-        Temporary Cortex placeholder: submitted structured tickets are shown below.
-      </p>
-      <p class="muted">
-        Voice intake auto-detects when you are done speaking, then moves to the next question.
-      </p>
+    <div class="app-shell">
+      <div class="main">
+        <div class="container">
+      <header class="page-header">
+        <div class="page-header-brand-row">
+          <div class="brand-photo-wrap">
+            <img
+              class="brand-photo"
+              src="{{ url_for('static', filename='teachers-fcu-logo.png') }}"
+              width="300"
+              height="52"
+              alt="Teachers Federal Credit Union logo"
+              decoding="async"
+            />
+          </div>
+          <div class="page-header-text">
+            <h1><span>Voice</span> ticket intake</h1>
+            <p class="lede muted">
+              Cortex placeholder: new tickets land in the sliding panel on the right.
+            </p>
+            <p class="lede muted">
+              Voice flow listens for end-of-utterance, then advances to the next question.
+            </p>
+          </div>
+        </div>
+      </header>
       <div class="card">
-        <h3>Device Access</h3>
-        <p id="camera-status" class="muted">Requesting camera access...</p>
-        <p id="microphone-status" class="muted">Requesting microphone access...</p>
-        <p id="presence-status" class="muted">Presence check: initializing...</p>
-        <p id="realtime-status" class="muted">Realtime idle.</p>
-        <button id="start-realtime">Start Realtime Voice</button>
-        <button id="stop-speaking" class="secondary" disabled>Stop & Re-ask</button>
-        <button id="start-typed-intake" class="secondary">Type Intent Instead</button>
-        <pre id="realtime-json" class="muted">(structured ticket preview appears here)</pre>
-        <pre id="realtime-debug" class="muted">(raw realtime event debug appears here)</pre>
-        <div id="typed-intake-panel" class="card" style="display: none;">
-          <h3>Typed Intent Intake</h3>
+        <h3>Device access</h3>
+        <p class="callout muted">
+          After a macOS upgrade, re-allow your browser under
+          <strong>System Settings → Privacy &amp; Security → Microphone</strong> (and Camera if you use presence). Prefer Chrome or Safari over a minimal preview window.
+        </p>
+        <div class="status-grid">
+          <p id="camera-status" class="muted">Requesting camera access...</p>
+          <p id="microphone-status" class="muted">Requesting microphone access...</p>
+          <p id="presence-status" class="muted">Presence check: initializing...</p>
+          <p id="realtime-status" class="muted">Realtime idle.</p>
+        </div>
+        <div class="btn-row">
+          <button type="button" id="start-realtime">Start realtime voice</button>
+          <button type="button" id="stop-speaking" class="secondary" disabled>Stop &amp; re-ask</button>
+          <button type="button" id="start-typed-intake" class="secondary">Type intent instead</button>
+        </div>
+        <pre id="realtime-json" class="panel-pre muted">(structured ticket preview appears here)</pre>
+        <pre id="realtime-debug" class="panel-pre muted">(raw realtime event debug appears here)</pre>
+        <div id="typed-intake-panel" class="card card-inset" style="display: none;">
+          <h3>Typed intent intake</h3>
           <p id="typed-question" class="muted"></p>
           <input
             id="typed-answer"
             type="text"
-            style="width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #334155; background: #0b1220; color: #e2e8f0;"
+            class="form-input"
             placeholder="Type your answer here"
           />
-          <div style="margin-top: 10px;">
-            <button id="typed-next">Next</button>
-            <button id="typed-cancel" class="secondary">Cancel</button>
+          <div class="btn-row mt">
+            <button type="button" id="typed-next">Next</button>
+            <button type="button" id="typed-cancel" class="secondary">Cancel</button>
           </div>
         </div>
         <audio id="assistant-audio" autoplay></audio>
         <video id="camera-preview" autoplay playsinline muted></video>
+        </div>
+      <div class="card">
+        <h3>Typed ticket (second path)</h3>
+        <p class="muted">
+          Same step-by-step questions as <strong>Type intent instead</strong> above — use this block when you want a separate typing area.
+        </p>
+        <div class="btn-row">
+          <button type="button" id="start-typed-intake-2" class="secondary">Start typed intake</button>
+        </div>
+        <p id="typed-2-status" class="muted" style="margin: 0 0 8px; min-height: 1.25em"></p>
+        <div id="typed-intake-panel-2" class="card card-inset" style="display: none">
+          <h3>Typed intent intake</h3>
+          <p id="typed-question-2" class="muted"></p>
+          <input
+            id="typed-answer-2"
+            type="text"
+            class="form-input"
+            placeholder="Type your answer here"
+          />
+          <div class="btn-row mt">
+            <button type="button" id="typed-next-2">Next</button>
+            <button type="button" id="typed-cancel-2" class="secondary">Cancel</button>
+          </div>
+        </div>
       </div>
-      <div id="tickets"></div>
+        </div>
+      </div>
+      <aside class="tickets-rail" aria-label="Submitted tickets">
+        <div class="tickets-rail-header">
+          <h2>Tickets</h2>
+          <p class="muted">Scroll to browse; newest first.</p>
+        </div>
+        <div id="tickets"></div>
+      </aside>
     </div>
 
     <script>
@@ -124,6 +594,13 @@
       const typedAnswerEl = document.getElementById("typed-answer");
       const typedNextBtn = document.getElementById("typed-next");
       const typedCancelBtn = document.getElementById("typed-cancel");
+      const startTypedIntake2Btn = document.getElementById("start-typed-intake-2");
+      const typedIntakePanel2 = document.getElementById("typed-intake-panel-2");
+      const typedQuestion2El = document.getElementById("typed-question-2");
+      const typedAnswer2El = document.getElementById("typed-answer-2");
+      const typedNext2Btn = document.getElementById("typed-next-2");
+      const typedCancel2Btn = document.getElementById("typed-cancel-2");
+      const typed2StatusEl = document.getElementById("typed-2-status");
       const cameraPreviewEl = document.getElementById("camera-preview");
       const assistantAudioEl = document.getElementById("assistant-audio");
       let mediaStream = null;
@@ -138,7 +615,16 @@
       let realtimeIsStopping = false;
       let lastAutoCommitMs = 0;
       let ignoreNextSpeechStoppedCommit = false;
-      let awaitingIntroReply = false;
+      const INTRO_PHASE = {
+        IDLE: "idle",
+        AWAITING_USER_MOOD: "awaiting_user_mood",
+        ACK_GENERATING: "ack_generating",
+        ACK_SPEAKING: "ack_speaking",
+        QUESTIONING: "questioning",
+      };
+      let introPhase = INTRO_PHASE.IDLE;
+      let introTurnId = 0;
+      let introCommitHoldUntilMs = 0;
       let pendingVoiceConfirmation = null;
       let faceDetector = null;
       let presenceCheckTimer = null;
@@ -197,6 +683,43 @@
       function getStepLabel(step) {
         return `${Math.min(step + 1, voiceIntakeQuestions.length)}/${voiceIntakeQuestions.length}`;
       }
+      function beginIntroAwaitingMood() {
+        introTurnId += 1;
+        introPhase = INTRO_PHASE.AWAITING_USER_MOOD;
+        introCommitHoldUntilMs = Date.now() + 1200;
+      }
+      function startQuestioningPhase() {
+        introPhase = INTRO_PHASE.QUESTIONING;
+      }
+      function deterministicIntroAck(userText) {
+        const t = String(userText || "").toLowerCase();
+        if (
+          t.includes("stressed") ||
+          t.includes("overwhelmed") ||
+          t.includes("anxious") ||
+          t.includes("worried") ||
+          t.includes("not great") ||
+          t.includes("tough")
+        ) {
+          return "Thanks for sharing that. We'll keep this focused and move through it clearly together.";
+        }
+        if (
+          t.includes("good") ||
+          t.includes("great") ||
+          t.includes("awesome") ||
+          t.includes("fantastic") ||
+          t.includes("doing well")
+        ) {
+          return "Great to hear. I'll keep this efficient and get what we need in three quick questions.";
+        }
+        return "Thanks for sharing. I'll keep this simple and guide you through three quick questions.";
+      }
+      async function fetchIntroAcknowledgmentWithTimeout(userText, timeoutMs = 3500) {
+        const timeoutPromise = new Promise((_, reject) => {
+          setTimeout(() => reject(new Error("mood_ack_timeout")), timeoutMs);
+        });
+        return Promise.race([fetchIntroAcknowledgment(userText), timeoutPromise]);
+      }
       function isYesConfirmation(transcript) {
         const t = String(transcript || "").toLowerCase();
         return (
@@ -233,6 +756,8 @@
       ];
       let typedIntakeAnswers = {};
       let typedIntakeIndex = 0;
+      let typedIntake2Answers = {};
+      let typedIntake2Index = 0;
 
       async function startDevices() {
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -243,19 +768,48 @@
         }
 
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({
+          const combined = await navigator.mediaDevices.getUserMedia({
             video: true,
             audio: true,
           });
-          cameraPreviewEl.srcObject = stream;
-          mediaStream = stream;
+          mediaStream = combined;
+          cameraPreviewEl.srcObject = combined;
           cameraStatusEl.textContent = "Camera is on.";
           microphoneStatusEl.textContent = "Microphone is on.";
           initializePresenceCheck();
-        } catch (error) {
-          cameraStatusEl.textContent = `Camera access blocked: ${error.message}`;
-          microphoneStatusEl.textContent = `Microphone access blocked: ${error.message}`;
-          presenceStatusEl.textContent = "Presence check unavailable.";
+          return;
+        } catch (_combinedError) {
+          // Combined often fails after OS upgrade if Camera is off for the browser; recover mic-only.
+        }
+
+        try {
+          mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch (audioError) {
+          cameraStatusEl.textContent = "Camera not started.";
+          microphoneStatusEl.textContent = `Microphone access blocked: ${audioError.message}`;
+          presenceStatusEl.textContent =
+            "If you use Safari: Safari → Settings → Websites → Microphone → allow for 127.0.0.1:5001.";
+          return;
+        }
+
+        microphoneStatusEl.textContent = "Microphone is on.";
+
+        try {
+          const videoOnly = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: "user" },
+            audio: false,
+          });
+          mediaStream = new MediaStream([
+            ...mediaStream.getAudioTracks(),
+            ...videoOnly.getVideoTracks(),
+          ]);
+          cameraPreviewEl.srcObject = videoOnly;
+          cameraStatusEl.textContent = "Camera is on.";
+          initializePresenceCheck();
+        } catch (videoError) {
+          cameraStatusEl.textContent = `Camera unavailable or denied — voice still works. (${videoError.message})`;
+          cameraPreviewEl.srcObject = null;
+          presenceStatusEl.textContent = "Presence check skipped (no camera stream).";
         }
       }
 
@@ -485,6 +1039,8 @@
       }
 
       function startTypedIntake() {
+        cancelTypedIntake2();
+        typed2StatusEl.textContent = "";
         typedIntakeAnswers = {};
         typedIntakeIndex = 0;
         typedIntakePanel.style.display = "block";
@@ -495,6 +1051,78 @@
         typedIntakePanel.style.display = "none";
         typedQuestionEl.textContent = "";
         typedAnswerEl.value = "";
+      }
+
+      function renderTypedQuestion2() {
+        const current = typedIntakeQuestions[typedIntake2Index];
+        if (!current) {
+          return;
+        }
+        typedQuestion2El.textContent = current.prompt;
+        typedAnswer2El.value = "";
+        typedAnswer2El.focus();
+      }
+
+      function startTypedIntake2() {
+        cancelTypedIntake();
+        typed2StatusEl.textContent = "";
+        typedIntake2Answers = {};
+        typedIntake2Index = 0;
+        typedIntakePanel2.style.display = "block";
+        renderTypedQuestion2();
+      }
+
+      function cancelTypedIntake2() {
+        typedIntakePanel2.style.display = "none";
+        typedQuestion2El.textContent = "";
+        typedAnswer2El.value = "";
+      }
+
+      async function submitTypedIntake2() {
+        const normalizedPriority = String(typedIntake2Answers.priority || "").toLowerCase();
+        const finalPayload = {
+          requestor_name: typedIntake2Answers.requestor_name || "Business Leader",
+          business_unit: typedIntake2Answers.business_unit || "Lending",
+          summary: typedIntake2Answers.summary || "Data request",
+          priority: ["low", "medium", "high", "urgent"].includes(normalizedPriority)
+            ? normalizedPriority
+            : "medium",
+          metric: typedIntake2Answers.metric || "unspecified metric",
+          time_period: typedIntake2Answers.time_period || "unspecified",
+          confidence: 0.9,
+          filters: {},
+          details: typedIntake2Answers.details || "",
+          source: "typed_intake_alt",
+        };
+
+        typed2StatusEl.textContent = "Submitting typed intent…";
+        try {
+          await submitStructuredTicket(finalPayload);
+          typed2StatusEl.textContent = "Typed intent submitted successfully.";
+          loadTickets();
+        } catch (error) {
+          typed2StatusEl.textContent = `Typed intent failed: ${error.message}`;
+        }
+      }
+
+      function handleTypedNext2() {
+        const current = typedIntakeQuestions[typedIntake2Index];
+        if (!current) {
+          return;
+        }
+        const answer = String(typedAnswer2El.value || "").trim();
+        if (!answer) {
+          return;
+        }
+        typedIntake2Answers[current.key] = answer;
+        typedIntake2Index += 1;
+
+        if (typedIntake2Index >= typedIntakeQuestions.length) {
+          cancelTypedIntake2();
+          submitTypedIntake2();
+          return;
+        }
+        renderTypedQuestion2();
       }
 
       async function submitTypedIntake() {
@@ -573,6 +1201,7 @@
       }
 
       let currentTtsUrl = null;
+      let speakJobId = 0;
 
       // Kill any leftover browser synthesis speech from a previous page state
       if ("speechSynthesis" in window) {
@@ -581,6 +1210,7 @@
 
       async function speakWithNaturalVoice(text, onEnd) {
         const audio = assistantAudioEl;
+        const thisSpeakJobId = ++speakJobId;
         try {
           audio.pause();
           audio.onended = null;
@@ -607,6 +1237,9 @@
           audio.muted = false;
           audio.volume = 1.0;
           audio.onended = () => {
+            if (thisSpeakJobId !== speakJobId) {
+              return;
+            }
             if (currentTtsUrl === url) {
               URL.revokeObjectURL(url);
               currentTtsUrl = null;
@@ -614,6 +1247,9 @@
             if (onEnd) onEnd();
           };
           audio.onerror = (e) => {
+            if (thisSpeakJobId !== speakJobId) {
+              return;
+            }
             console.error("TTS audio playback error:", e, audio.error);
             if (currentTtsUrl === url) {
               URL.revokeObjectURL(url);
@@ -625,6 +1261,9 @@
           const playPromise = audio.play();
           if (playPromise && typeof playPromise.then === "function") {
             playPromise.catch((err) => {
+              if (thisSpeakJobId !== speakJobId) {
+                return;
+              }
               console.error("audio.play() rejected (autoplay policy?):", err);
               realtimeStatusEl.textContent =
                 "Audio blocked by browser. Click anywhere on the page, then Start Realtime Voice again.";
@@ -731,24 +1370,53 @@
           if (!rawTranscript) {
             return;
           }
+          if (
+            (introPhase === INTRO_PHASE.ACK_GENERATING || introPhase === INTRO_PHASE.ACK_SPEAKING) &&
+            !pendingVoiceConfirmation
+          ) {
+            // Ignore extra transcript events while acknowledgment is being produced/spoken.
+            return;
+          }
           if (!isLikelyEnglish(rawTranscript)) {
+            if (introPhase === INTRO_PHASE.AWAITING_USER_MOOD) {
+              realtimeStatusEl.textContent = "Please share your mood in English, then we will begin.";
+              speakWithNaturalVoice(
+                "I can only process English responses right now. Please tell me how you are doing today in English."
+              );
+              return;
+            }
             realtimeStatusEl.textContent = "Please respond in English so I can capture your request accurately.";
             askCurrentVoiceQuestion("I can only process English responses right now. Please answer in English.");
             return;
           }
-          if (awaitingIntroReply) {
-            awaitingIntroReply = false;
+          if (introPhase === INTRO_PHASE.AWAITING_USER_MOOD) {
+            const thisTurnId = introTurnId;
+            introPhase = INTRO_PHASE.ACK_GENERATING;
             realtimeStatusEl.textContent = "Thanks for sharing. Let me respond.";
-            let acknowledgment = "Thanks for sharing that with me.";
+            let acknowledgment = deterministicIntroAck(rawTranscript);
             try {
-              const generated = await fetchIntroAcknowledgment(rawTranscript);
+              const generated = await fetchIntroAcknowledgmentWithTimeout(rawTranscript);
               if (generated) {
                 acknowledgment = generated;
               }
             } catch (error) {
               console.error("Mood response fallback:", error);
             }
-            speakWithNaturalVoice(acknowledgment, () => askCurrentVoiceQuestion("First question:"));
+            if (!realtimeIsActive || thisTurnId !== introTurnId || introPhase !== INTRO_PHASE.ACK_GENERATING) {
+              return;
+            }
+            introPhase = INTRO_PHASE.ACK_SPEAKING;
+            introCommitHoldUntilMs = Date.now() + 1100;
+            speakWithNaturalVoice(acknowledgment, () => {
+              if (!realtimeIsActive || thisTurnId !== introTurnId) {
+                return;
+              }
+              startQuestioningPhase();
+              askCurrentVoiceQuestion("First question:");
+            });
+            return;
+          }
+          if (introPhase !== INTRO_PHASE.QUESTIONING) {
             return;
           }
           if (pendingVoiceConfirmation) {
@@ -786,7 +1454,7 @@
           if (isStartOverRequest(transcript)) {
             voiceIntakeStep = 0;
             voiceIntakeAnswers = {};
-            awaitingIntroReply = false;
+            startQuestioningPhase();
             pendingVoiceConfirmation = null;
             realtimeStatusEl.textContent = "Starting over from question 1.";
             askCurrentVoiceQuestion("No problem, let's restart.");
@@ -839,7 +1507,13 @@
             ignoreNextSpeechStoppedCommit = false;
             return;
           }
+          if (introPhase === INTRO_PHASE.ACK_GENERATING || introPhase === INTRO_PHASE.ACK_SPEAKING) {
+            return;
+          }
           const now = Date.now();
+          if (now < introCommitHoldUntilMs) {
+            return;
+          }
           if (now - lastAutoCommitMs < 800) {
             return;
           }
@@ -1010,7 +1684,7 @@
           realtimeConversationInFlight = false;
           voiceIntakeStep = 0;
           voiceIntakeAnswers = {};
-          awaitingIntroReply = true;
+          beginIntroAwaitingMood();
           pendingVoiceConfirmation = null;
           realtimeStatusEl.textContent = "Creating ephemeral Realtime session...";
           const tokenResp = await fetch("/api/realtime/session", { method: "POST" });
@@ -1119,10 +1793,28 @@
         }
         finalIntentRequested = false;
         intentSubmitted = false;
-        awaitingIntroReply = false;
+        introPhase = INTRO_PHASE.IDLE;
+        introTurnId += 1;
+        introCommitHoldUntilMs = 0;
         pendingVoiceConfirmation = null;
         realtimeIsStopping = false;
         realtimeStatusEl.textContent = reason;
+      }
+
+      function escapeHtml(value) {
+        return String(value ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+
+      function ticketPillClass(priority) {
+        const key = String(priority || "medium").toLowerCase();
+        if (key.includes("urgent")) return "urgent";
+        if (key.includes("high")) return "high";
+        if (key.includes("low")) return "low";
+        return "medium";
       }
 
       function renderTickets(tickets) {
@@ -1132,23 +1824,30 @@
         }
 
         ticketsEl.innerHTML = tickets
-          .map(
-            (ticket) => `
-              <div class="card">
-                <div class="pill">${ticket.priority.toUpperCase()}</div>
-                <h3>${ticket.summary}</h3>
-                <p><strong>Requestor:</strong> ${ticket.requestor_name}</p>
-                <p><strong>Business Unit:</strong> ${ticket.business_unit}</p>
-                <p><strong>Metric:</strong> ${ticket.metric}</p>
-                <p><strong>Time Period:</strong> ${ticket.time_period}</p>
-                <p><strong>Confidence:</strong> ${ticket.confidence}</p>
-                <p><strong>Filters:</strong> ${JSON.stringify(ticket.filters || {})}</p>
-                <p><strong>Source:</strong> ${ticket.source}</p>
-                <p><strong>Created:</strong> ${ticket.created_at_utc}</p>
-                <pre>${ticket.details || "(no additional details)"}</pre>
-              </div>
-            `
-          )
+          .map((ticket) => {
+            const pill = ticketPillClass(ticket.priority);
+            const priLabel = escapeHtml(String(ticket.priority || "—").toUpperCase());
+            const filtersJson = escapeHtml(JSON.stringify(ticket.filters || {}));
+            return `
+              <article class="card ticket-card">
+                <div class="ticket-top">
+                  <div class="pill pill-${pill}">${priLabel}</div>
+                  <time class="ticket-time">${escapeHtml(ticket.created_at_utc)}</time>
+                </div>
+                <h3 class="ticket-title">${escapeHtml(ticket.summary)}</h3>
+                <div class="ticket-fields">
+                  <span class="tf-label">Requestor</span><span class="tf-val">${escapeHtml(ticket.requestor_name)}</span>
+                  <span class="tf-label">Business unit</span><span class="tf-val">${escapeHtml(ticket.business_unit)}</span>
+                  <span class="tf-label">Metric</span><span class="tf-val">${escapeHtml(ticket.metric)}</span>
+                  <span class="tf-label">Time period</span><span class="tf-val">${escapeHtml(ticket.time_period)}</span>
+                  <span class="tf-label">Confidence</span><span class="tf-val">${escapeHtml(ticket.confidence)}</span>
+                  <span class="tf-label">Filters</span><span class="tf-val">${filtersJson}</span>
+                  <span class="tf-label">Source</span><span class="tf-val">${escapeHtml(ticket.source)}</span>
+                </div>
+                <pre class="ticket-pre">${escapeHtml(ticket.details || "(no additional details)")}</pre>
+              </article>
+            `;
+          })
           .join("");
       }
 
@@ -1158,7 +1857,7 @@
           const data = await response.json();
           renderTickets(data.tickets || []);
         } catch (error) {
-          ticketsEl.innerHTML = `<div class="empty">Failed to load tickets: ${error.message}</div>`;
+          ticketsEl.innerHTML = `<div class="empty">Failed to load tickets: ${escapeHtml(error.message)}</div>`;
         }
       }
 
@@ -1170,6 +1869,14 @@
       typedAnswerEl.addEventListener("keydown", (event) => {
         if (event.key === "Enter") {
           handleTypedNext();
+        }
+      });
+      startTypedIntake2Btn.addEventListener("click", startTypedIntake2);
+      typedNext2Btn.addEventListener("click", handleTypedNext2);
+      typedCancel2Btn.addEventListener("click", cancelTypedIntake2);
+      typedAnswer2El.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          handleTypedNext2();
         }
       });
       startDevices();

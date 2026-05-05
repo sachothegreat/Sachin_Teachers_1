@@ -26,10 +26,10 @@ You already have a `.env` file. Update:
 
 ```bash
 source venv/bin/activate
-flask --app app.py run --debug
+flask --app app.py run --debug --port 5001
 ```
 
-Then open: `http://127.0.0.1:5000`
+Then open: `http://127.0.0.1:5001`
 
 ## API Endpoints
 

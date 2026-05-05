@@ -103,6 +103,63 @@ def _extract_first_int(text: str) -> int | None:
         return None
 
 
+def _classify_mood_text(text: str) -> str:
+    normalized = _sanitize_text(text).lower()
+    if not normalized:
+        return "neutral"
+    stressed_terms = (
+        "stressed",
+        "overwhelmed",
+        "anxious",
+        "worried",
+        "frustrated",
+        "burned out",
+        "not good",
+        "not great",
+        "bad",
+        "rough",
+    )
+    positive_terms = (
+        "great",
+        "good",
+        "doing well",
+        "fantastic",
+        "excellent",
+        "awesome",
+        "energized",
+        "productive",
+    )
+    if any(term in normalized for term in stressed_terms):
+        return "stressed"
+    if any(term in normalized for term in positive_terms):
+        return "positive"
+    return "neutral"
+
+
+def _fallback_mood_ack(user_text: str) -> str:
+    mood = _classify_mood_text(user_text)
+    if mood == "stressed":
+        return "Thanks for sharing that. I will keep this clear and focused so we can move quickly."
+    if mood == "positive":
+        return "Great to hear. Let's keep the momentum and capture your request in three quick questions."
+    return "Thanks for sharing. I will keep this concise and guide you through three quick questions."
+
+
+def _normalize_mood_ack(text: str, max_words: int = 24) -> str:
+    cleaned = _sanitize_text(str(text or ""))
+    cleaned = cleaned.replace("?", ".")
+    cleaned = re.sub(r"^[\"'“”‘’]+|[\"'“”‘’]+$", "", cleaned).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if not cleaned:
+        return ""
+    words = cleaned.split()
+    if len(words) > max_words:
+        cleaned = " ".join(words[:max_words]).rstrip(".,;:!?") + "."
+    if cleaned[-1] not in ".!?":
+        cleaned += "."
+    return cleaned
+
+
 def _forward_to_cortex(ticket: dict) -> dict:
     """
     Placeholder Cortex call. Simulates a synchronous request/response.
@@ -272,6 +329,7 @@ def mood_response():
         return _error("text is required")
 
     model = os.getenv("OPENAI_TEXT_MODEL", "gpt-4.1-mini")
+    fallback_ack = _fallback_mood_ack(user_text)
     try:
         response = _post_openai(
             url="https://api.openai.com/v1/responses",
@@ -288,10 +346,12 @@ def mood_response():
                             {
                                 "type": "input_text",
                                 "text": (
-                                    "You are a professional voice assistant for business users. "
-                                    "Write one short English empathy acknowledgment to the user's mood check-in. "
-                                    "Be warm, concise, and supportive. Do not ask any follow-up question. "
-                                    "No emojis. Max 20 words."
+                                    "You are a polished enterprise voice intake assistant. "
+                                    "Write exactly one short acknowledgment sentence in clear professional English. "
+                                    "Sound warm, confident, and efficient. "
+                                    "Reflect the user's mood without repeating their wording. "
+                                    "Do not ask questions. Do not use emojis. "
+                                    "Keep it between 10 and 20 words."
                                 ),
                             }
                         ],
@@ -302,30 +362,28 @@ def mood_response():
                     },
                 ],
                 "max_output_tokens": 60,
+                "temperature": 0.4,
             },
             timeout=20,
         )
     except requests.RequestException as exc:
-        return _error(f"Failed to reach OpenAI response API: {exc}", status=502)
+        return jsonify({"acknowledgment": fallback_ack, "fallback_used": True, "reason": str(exc)})
 
     if not response.ok:
-        return (
-            jsonify(
-                {
-                    "error": "OpenAI mood response generation failed",
-                    "status_code": response.status_code,
-                    "details": response.text,
-                }
-            ),
-            502,
+        return jsonify(
+            {
+                "acknowledgment": fallback_ack,
+                "fallback_used": True,
+                "status_code": response.status_code,
+            }
         )
 
     data = response.json()
-    acknowledgment = _extract_response_text(data)
+    acknowledgment = _normalize_mood_ack(_extract_response_text(data))
     if not acknowledgment:
-        acknowledgment = "Thanks for sharing that. I appreciate it."
+        acknowledgment = fallback_ack
 
-    return jsonify({"acknowledgment": acknowledgment})
+    return jsonify({"acknowledgment": acknowledgment, "fallback_used": False})
 
 
 @app.post("/api/presence-check")
@@ -459,4 +517,4 @@ def submit_ticket():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5001")), debug=True)
