@@ -497,12 +497,12 @@
             />
           </div>
           <div class="page-header-text">
-            <h1><span>Voice</span> ticket intake</h1>
+            <h1>Hi, I'm <span>Smartie</span></h1>
             <p class="lede muted">
-              Cortex placeholder: new tickets land in the sliding panel on the right.
+              I can help you explore our Enterprise Data for Insights.
             </p>
             <p class="lede muted">
-              Voice flow listens for end-of-utterance, then advances to the next question.
+              Ask me about any metrics, trends, or reports across your business units.
             </p>
           </div>
         </div>
@@ -614,7 +614,13 @@
       let realtimeIsActive = false;
       let realtimeIsStopping = false;
       let lastAutoCommitMs = 0;
+      let lastTtsStartMs = 0;
+      let speechStartedMs = 0;
+      const TTS_INTERRUPT_PROTECTION_MS = 2000;
+      const MIN_SPEECH_DURATION_MS = 700;
       let ignoreNextSpeechStoppedCommit = false;
+      let watchdogTimer = null;
+      const WATCHDOG_TIMEOUT_MS = 8000; // re-ask if no response in 8s
       const INTRO_PHASE = {
         IDLE: "idle",
         AWAITING_USER_MOOD: "awaiting_user_mood",
@@ -639,22 +645,30 @@
       const MULTI_FACE_CONFIRMATION_THRESHOLD = 2;
       const intentReadyMarker = "INTENT_READY";
       const voiceIntakeQuestions = [
-        "What is your name?",
-        "What is the department?",
-        "What info do you want relayed?",
+        "Which business unit are you with?",
+        "What would you like to explore today?",
+        "What query would you like relayed?",
       ];
-      const voiceIntakeKeys = ["requestor_name", "business_unit", "summary"];
+      const voiceIntakeKeys = ["business_unit", "summary", "details"];
       let voiceIntakeStep = 0;
       let voiceIntakeAnswers = {};
+      let conversationHistory = []; // [{role:"assistant"|"user", content:"..."}]
+      let q3History = [];          // Q3-specific attempt/coaching pairs (up to 10 entries)
       const voiceAcknowledgments = ["Got it.", "Thanks.", "Perfect.", "Nice.", "Okay."];
       function randomVoiceAck() {
         return voiceAcknowledgments[Math.floor(Math.random() * voiceAcknowledgments.length)];
       }
-      function shortEcho(text, maxLen = 70) {
+      function shortEcho(text, maxLen = 160) {
         const normalized = String(text || "").replace(/\s+/g, " ").trim();
         if (!normalized) return "";
         if (normalized.length <= maxLen) return normalized;
         return `${normalized.slice(0, maxLen - 3).trim()}...`;
+      }
+      function ttsEcho(text, maxWords = 30) {
+        // For TTS confirmation, cap at N words so it doesn't read a novel
+        const words = String(text || "").trim().split(/\s+/);
+        if (words.length <= maxWords) return text;
+        return `${words.slice(0, maxWords).join(" ")}... and so on`;
       }
       function isRepeatRequest(transcript) {
         return (
@@ -720,6 +734,90 @@
         });
         return Promise.race([fetchIntroAcknowledgment(userText), timeoutPromise]);
       }
+      async function translateText(text) {
+        try {
+          const response = await fetch("/api/translate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text }),
+          });
+          if (!response.ok) return null;
+          const data = await response.json();
+          return data.translated || null;
+        } catch (_) {
+          return null;
+        }
+      }
+
+      async function validateBankingQuery(query, businessUnit = "", historyOverride = null) {
+        const timeout = new Promise(resolve =>
+          setTimeout(() => resolve({ valid: true }), 5000) // fail open after 5s
+        );
+        const fetchCall = (async () => {
+          try {
+            const historyToSend = historyOverride !== null
+              ? historyOverride.slice(-10)
+              : conversationHistory.slice(-10);
+            const response = await fetch("/api/validate-query", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                query,
+                business_unit: businessUnit,
+                history: historyToSend,
+              }),
+            });
+            if (!response.ok) return { valid: true };
+            return await response.json();
+          } catch (_) {
+            return { valid: true };
+          }
+        })();
+        return Promise.race([fetchCall, timeout]);
+      }
+
+      function startWatchdog() {
+        clearWatchdog();
+        watchdogTimer = setTimeout(() => {
+          if (!realtimeIsActive || intentSubmitted) return;
+          realtimeStatusEl.textContent = "Smartie is ready — please go ahead.";
+          askCurrentVoiceQuestion();
+        }, WATCHDOG_TIMEOUT_MS);
+      }
+      function clearWatchdog() {
+        if (watchdogTimer) {
+          clearTimeout(watchdogTimer);
+          watchdogTimer = null;
+        }
+      }
+
+      function isNoisyTranscript(text) {
+        const t = String(text || "").trim();
+        // Whisper noise markers like [music], [noise], (laughter), etc.
+        if (/[\[\(]/.test(t)) return true;
+        // Pure punctuation or symbols, no real words at all
+        if (/^[^a-zA-Z0-9]+$/.test(t)) return true;
+        // Very short single characters — not real speech
+        if (t.length < 2) return true;
+        return false;
+      }
+
+      function isValidExplorationQuery(text) {
+        const t = String(text || "").toLowerCase();
+        const validKeywords = [
+          "metric", "metrics", "report", "reports", "trend", "trends",
+          "data", "analysis", "analytics", "insight", "insights",
+          "number", "numbers", "stat", "stats", "statistics",
+          "performance", "dashboard", "volume", "balance", "growth",
+          "loan", "lending", "delinquency", "member", "deposit",
+          "revenue", "rate", "total", "average", "sum", "count",
+          "monthly", "quarterly", "yearly", "annual", "weekly",
+          "increase", "decrease", "change", "compare", "forecast",
+          "projection", "budget", "variance", "risk", "portfolio",
+        ];
+        return validKeywords.some(kw => t.includes(kw));
+      }
+
       function isYesConfirmation(transcript) {
         const t = String(transcript || "").toLowerCase();
         return (
@@ -746,13 +844,9 @@
         );
       }
       const typedIntakeQuestions = [
-        { key: "requestor_name", prompt: "What is your name?" },
-        { key: "business_unit", prompt: "Which business unit is this for?" },
-        { key: "summary", prompt: "Give a short summary of the request." },
-        { key: "priority", prompt: "Priority (low, medium, high, urgent)?" },
-        { key: "metric", prompt: "What metric do you need?" },
-        { key: "time_period", prompt: "What time period should be used?" },
-        { key: "details", prompt: "Any extra details?" },
+        { key: "business_unit", prompt: "Which business unit are you with?" },
+        { key: "summary", prompt: "What would you like to explore today? You can ask about any metrics, trends, or reports." },
+        { key: "details", prompt: "What query would you like relayed? Please be specific and banking-related." },
       ];
       let typedIntakeAnswers = {};
       let typedIntakeIndex = 0;
@@ -1079,40 +1173,62 @@
       }
 
       async function submitTypedIntake2() {
-        const normalizedPriority = String(typedIntake2Answers.priority || "").toLowerCase();
         const finalPayload = {
-          requestor_name: typedIntake2Answers.requestor_name || "Business Leader",
-          business_unit: typedIntake2Answers.business_unit || "Lending",
+          requestor_name: "Teachers Employee",
+          business_unit: typedIntake2Answers.business_unit || "Unspecified",
           summary: typedIntake2Answers.summary || "Data request",
-          priority: ["low", "medium", "high", "urgent"].includes(normalizedPriority)
-            ? normalizedPriority
-            : "medium",
-          metric: typedIntake2Answers.metric || "unspecified metric",
-          time_period: typedIntake2Answers.time_period || "unspecified",
+          priority: "medium",
+          metric: typedIntake2Answers.summary || "unspecified",
+          time_period: "current",
           confidence: 0.9,
           filters: {},
-          details: typedIntake2Answers.details || "",
+          details: typedIntake2Answers.summary || "",
           source: "typed_intake_alt",
         };
 
-        typed2StatusEl.textContent = "Submitting typed intent…";
+        typed2StatusEl.textContent = "Please hold on while I fetch you the results...";
         try {
           await submitStructuredTicket(finalPayload);
-          typed2StatusEl.textContent = "Typed intent submitted successfully.";
+          typed2StatusEl.textContent = "Results ready.";
           loadTickets();
         } catch (error) {
           typed2StatusEl.textContent = `Typed intent failed: ${error.message}`;
         }
       }
 
-      function handleTypedNext2() {
+      async function handleTypedNext2() {
         const current = typedIntakeQuestions[typedIntake2Index];
         if (!current) {
           return;
         }
-        const answer = String(typedAnswer2El.value || "").trim();
+        let answer = String(typedAnswer2El.value || "").trim();
         if (!answer) {
           return;
+        }
+        if (!isLikelyEnglish(answer)) {
+          typedQuestion2El.textContent = "Translating...";
+          const translated = await translateText(answer);
+          if (translated) {
+            answer = translated;
+            typedAnswer2El.value = translated;
+          }
+        }
+        if (current.key === "summary" && !isValidExplorationQuery(answer)) {
+          typedQuestion2El.textContent =
+            "Come on fam, you and I both know that isn't on the menu. Try asking about metrics, reports, or trends!";
+          typedAnswer2El.value = "";
+          typedAnswer2El.focus();
+          return;
+        }
+        if (current.key === "details") {
+          typedQuestion2El.textContent = "Checking your query...";
+          const validation = await validateBankingQuery(answer, typedIntake2Answers.business_unit || "");
+          if (!validation.valid) {
+            typedQuestion2El.textContent = validation.suggestion || "That's a bit vague or off-topic. Please ask something specific and banking-related.";
+            typedAnswer2El.value = "";
+            typedAnswer2El.focus();
+            return;
+          }
         }
         typedIntake2Answers[current.key] = answer;
         typedIntake2Index += 1;
@@ -1126,41 +1242,63 @@
       }
 
       async function submitTypedIntake() {
-        const normalizedPriority = String(typedIntakeAnswers.priority || "").toLowerCase();
         const finalPayload = {
-          requestor_name: typedIntakeAnswers.requestor_name || "Business Leader",
-          business_unit: typedIntakeAnswers.business_unit || "Lending",
+          requestor_name: "Teachers Employee",
+          business_unit: typedIntakeAnswers.business_unit || "Unspecified",
           summary: typedIntakeAnswers.summary || "Data request",
-          priority: ["low", "medium", "high", "urgent"].includes(normalizedPriority)
-            ? normalizedPriority
-            : "medium",
-          metric: typedIntakeAnswers.metric || "unspecified metric",
-          time_period: typedIntakeAnswers.time_period || "unspecified",
+          priority: "medium",
+          metric: typedIntakeAnswers.summary || "unspecified",
+          time_period: "current",
           confidence: 0.9,
           filters: {},
-          details: typedIntakeAnswers.details || "",
+          details: typedIntakeAnswers.summary || "",
           source: "typed_intake",
         };
 
         realtimeJsonEl.textContent = JSON.stringify(finalPayload, null, 2);
-        realtimeStatusEl.textContent = "Submitting typed intent...";
+        realtimeStatusEl.textContent = "Please hold on while I fetch you the results...";
         try {
           await submitStructuredTicket(finalPayload);
-          realtimeStatusEl.textContent = "Typed intent submitted successfully.";
+          realtimeStatusEl.textContent = "Results ready.";
           loadTickets();
         } catch (error) {
           realtimeStatusEl.textContent = `Typed intent failed: ${error.message}`;
         }
       }
 
-      function handleTypedNext() {
+      async function handleTypedNext() {
         const current = typedIntakeQuestions[typedIntakeIndex];
         if (!current) {
           return;
         }
-        const answer = String(typedAnswerEl.value || "").trim();
+        let answer = String(typedAnswerEl.value || "").trim();
         if (!answer) {
           return;
+        }
+        if (!isLikelyEnglish(answer)) {
+          typedQuestionEl.textContent = "Translating...";
+          const translated = await translateText(answer);
+          if (translated) {
+            answer = translated;
+            typedAnswerEl.value = translated;
+          }
+        }
+        if (current.key === "summary" && !isValidExplorationQuery(answer)) {
+          typedQuestionEl.textContent =
+            "Come on fam, you and I both know that isn't on the menu. Try asking about metrics, reports, or trends!";
+          typedAnswerEl.value = "";
+          typedAnswerEl.focus();
+          return;
+        }
+        if (current.key === "details") {
+          typedQuestionEl.textContent = "Checking your query...";
+          const validation = await validateBankingQuery(answer, typedIntakeAnswers.business_unit || "");
+          if (!validation.valid) {
+            typedQuestionEl.textContent = validation.suggestion || "That's a bit vague or off-topic. Please ask something specific and banking-related.";
+            typedAnswerEl.value = "";
+            typedAnswerEl.focus();
+            return;
+          }
         }
         typedIntakeAnswers[current.key] = answer;
         typedIntakeIndex += 1;
@@ -1258,6 +1396,7 @@
             if (onEnd) onEnd();
           };
 
+          lastTtsStartMs = Date.now();
           const playPromise = audio.play();
           if (playPromise && typeof playPromise.then === "function") {
             playPromise.catch((err) => {
@@ -1316,30 +1455,32 @@
 
       async function finalizeVoiceIntake() {
         const payload = {
-          requestor_name: voiceIntakeAnswers.requestor_name || "Business Leader",
+          requestor_name: "Teachers Employee",
           business_unit: voiceIntakeAnswers.business_unit || "Unspecified",
-          summary: voiceIntakeAnswers.summary || "Unspecified request",
+          summary: voiceIntakeAnswers.summary || "Data request",
           priority: "medium",
-          metric: "info_relay",
-          time_period: "unspecified",
+          metric: voiceIntakeAnswers.summary || "unspecified",
+          time_period: "current",
           confidence: 0.95,
           filters: {},
-          details: voiceIntakeAnswers.summary || "Unspecified request",
+          details: voiceIntakeAnswers.summary || "Data request",
           source: "openai_realtime",
         };
 
         realtimeJsonEl.textContent = JSON.stringify(payload, null, 2);
-        realtimeStatusEl.textContent = "Submitting 3-field intake...";
-        try {
-          await submitStructuredTicket(payload);
-          intentSubmitted = true;
-          realtimeStatusEl.textContent = "Intent captured and submitted.";
-          loadTickets();
-          stopRealtime();
-        } catch (error) {
-          intentSubmitted = false;
-          realtimeStatusEl.textContent = `Ticket validation failed: ${error.message}`;
-        }
+        realtimeStatusEl.textContent = "Fetching your results...";
+        speakWithNaturalVoice("Please hold on while I fetch you the results.", async () => {
+          try {
+            await submitStructuredTicket(payload);
+            intentSubmitted = true;
+            realtimeStatusEl.textContent = "Results ready.";
+            loadTickets();
+            stopRealtime();
+          } catch (error) {
+            intentSubmitted = false;
+            realtimeStatusEl.textContent = `Request failed: ${error.message}`;
+          }
+        });
       }
 
       async function handleRealtimeEvent(event) {
@@ -1365,9 +1506,16 @@
           if (intentSubmitted || finalIntentRequested || realtimeAwaitingTicket) {
             return;
           }
+          clearWatchdog();
           const rawTranscript = String(msg.transcript || "").trim();
           const transcript = rawTranscript.toLowerCase();
           if (!rawTranscript) {
+            return;
+          }
+          // Silently discard noise transcripts — but never during yes/no confirmation
+          // since "yes", "no", "yeah" etc. are short and would get wrongly filtered
+          if (!pendingVoiceConfirmation && isNoisyTranscript(rawTranscript)) {
+            askCurrentVoiceQuestion();
             return;
           }
           if (
@@ -1378,15 +1526,22 @@
             return;
           }
           if (!isLikelyEnglish(rawTranscript)) {
-            if (introPhase === INTRO_PHASE.AWAITING_USER_MOOD) {
-              realtimeStatusEl.textContent = "Please share your mood in English, then we will begin.";
-              speakWithNaturalVoice(
-                "I can only process English responses right now. Please tell me how you are doing today in English."
-              );
+            realtimeStatusEl.textContent = "Translating your response...";
+            const translated = await translateText(rawTranscript);
+            if (!translated) {
+              askCurrentVoiceQuestion("I had trouble understanding that. Please try again.");
               return;
             }
-            realtimeStatusEl.textContent = "Please respond in English so I can capture your request accurately.";
-            askCurrentVoiceQuestion("I can only process English responses right now. Please answer in English.");
+            realtimeStatusEl.textContent = `Translated: "${translated}"`;
+            // Re-inject as English and fall through to normal processing
+            msg._translatedTranscript = translated;
+            // Re-dispatch with translated text by mutating rawTranscript reference
+            const translatedEvent = new MessageEvent("message", { data: JSON.stringify({
+              ...msg,
+              type: "conversation.item.input_audio_transcription.completed",
+              transcript: translated,
+            })});
+            handleRealtimeEvent(translatedEvent);
             return;
           }
           if (introPhase === INTRO_PHASE.AWAITING_USER_MOOD) {
@@ -1421,10 +1576,30 @@
           }
           if (pendingVoiceConfirmation) {
             if (isYesConfirmation(transcript)) {
-              const { key, value, step } = pendingVoiceConfirmation;
+              const { key, value, step, validation } = pendingVoiceConfirmation;
+              // Q3: check if background validation is done and failed
+              if (step === 2) {
+                if (validation === null) {
+                  // Still validating — hold briefly and let user know
+                  realtimeStatusEl.textContent = "Just a moment, checking your query...";
+                  speakWithNaturalVoice("Just one moment while I check that for you.");
+                  return;
+                }
+                if (!validation.valid) {
+                  pendingVoiceConfirmation = null;
+                  const coaching = validation.suggestion || "Try something more specific and banking-related.";
+                  q3History.push({ role: "assistant", content: coaching });
+                  speakWithNaturalVoice(`${coaching} So let me ask again — what query would you like relayed?`);
+                  return;
+                }
+              }
               voiceIntakeAnswers[key] = value;
               pendingVoiceConfirmation = null;
               voiceIntakeStep = step + 1;
+              // Q3 confirmed — clear the Q3-specific history
+              if (step === 2) {
+                q3History = [];
+              }
               if (voiceIntakeStep >= voiceIntakeQuestions.length) {
                 const echo = shortEcho(value);
                 if (echo) {
@@ -1432,7 +1607,12 @@
                 }
                 finalizeVoiceIntake();
               } else {
-                askCurrentVoiceQuestion("Perfect, confirmed.");
+                const ack = voiceIntakeStep === 1
+                  ? "Got it. You can ask me about any metrics, trends, or reports."
+                  : voiceIntakeStep === 2
+                  ? "Perfect. And lastly,"
+                  : "Perfect, confirmed.";
+                askCurrentVoiceQuestion(ack);
               }
               return;
             }
@@ -1454,6 +1634,7 @@
           if (isStartOverRequest(transcript)) {
             voiceIntakeStep = 0;
             voiceIntakeAnswers = {};
+            q3History = [];
             startQuestioningPhase();
             pendingVoiceConfirmation = null;
             realtimeStatusEl.textContent = "Starting over from question 1.";
@@ -1474,7 +1655,7 @@
               finalizeVoiceIntake();
             } else {
               realtimeStatusEl.textContent =
-                `Please answer remaining questions (${voiceIntakeStep + 1}/3 captured).`;
+                `Please answer remaining questions (${voiceIntakeStep + 1}/${voiceIntakeQuestions.length} captured).`;
               askCurrentVoiceQuestion(randomVoiceAck());
             }
             return;
@@ -1485,17 +1666,57 @@
           if (!key) {
             return;
           }
-          pendingVoiceConfirmation = { key, value: rawTranscript, step };
+          if (step === 1 && !isValidExplorationQuery(rawTranscript)) {
+            realtimeStatusEl.textContent = "Smartie: That's not on the menu.";
+            speakWithNaturalVoice(
+              "Come on fam, you and I both know that isn't on the menu. Try asking about metrics, reports, or trends!"
+            );
+            return;
+          }
+          // Respond immediately for all steps — same response time across Q1, Q2, Q3
+          if (step === 2) {
+            // Track Q3 attempts separately so the validator remembers the full Q3 history
+            q3History.push({ role: "user", content: rawTranscript });
+          } else {
+            conversationHistory.push({ role: "user", content: rawTranscript });
+          }
+          pendingVoiceConfirmation = { key, value: rawTranscript, step, validation: null };
           const echo = shortEcho(rawTranscript);
+          const spokenEcho = ttsEcho(rawTranscript);
           realtimeStatusEl.textContent = `Confirming (${getStepLabel(step)}): ${echo}`;
-          speakWithNaturalVoice(
-            `I heard "${echo}". Is that correct? Please say yes or no.`
-          );
+          speakWithNaturalVoice(`I heard "${spokenEcho}". Is that correct? Please say yes or no.`);
+          // For Q3, kick off validation in the background while user confirms
+          if (step === 2) {
+            validateBankingQuery(rawTranscript, voiceIntakeAnswers.business_unit || "", q3History).then(result => {
+              if (pendingVoiceConfirmation && pendingVoiceConfirmation.value === rawTranscript) {
+                // Use resolved query from AI if it clarified a vague input from context
+                if (result.resolved_query) {
+                  pendingVoiceConfirmation.value = result.resolved_query;
+                }
+                pendingVoiceConfirmation.validation = result;
+              }
+            });
+          }
           return;
         }
 
         if (msg.type === "input_audio_buffer.speech_started") {
+          speechStartedMs = Date.now();
           realtimeStatusEl.textContent = "Listening...";
+          const ttsAge = Date.now() - lastTtsStartMs;
+          if (ttsAge > TTS_INTERRUPT_PROTECTION_MS) {
+            try {
+              assistantAudioEl.pause();
+              assistantAudioEl.currentTime = 0;
+              assistantAudioEl.onended = null;
+              assistantAudioEl.onerror = null;
+              if (currentTtsUrl) {
+                URL.revokeObjectURL(currentTtsUrl);
+                currentTtsUrl = null;
+              }
+              speakJobId += 1;
+            } catch (_) {}
+          }
           return;
         }
 
@@ -1510,15 +1731,22 @@
           if (introPhase === INTRO_PHASE.ACK_GENERATING || introPhase === INTRO_PHASE.ACK_SPEAKING) {
             return;
           }
+          // Ignore blips — external sounds, coughs, door slams etc. are typically < 700ms
+          const speechDuration = Date.now() - speechStartedMs;
+          if (speechDuration < MIN_SPEECH_DURATION_MS) {
+            dataChannel.send(JSON.stringify({ type: "input_audio_buffer.clear" }));
+            return;
+          }
           const now = Date.now();
           if (now < introCommitHoldUntilMs) {
             return;
           }
-          if (now - lastAutoCommitMs < 800) {
+          if (now - lastAutoCommitMs < 1500) {
             return;
           }
           lastAutoCommitMs = now;
           realtimeStatusEl.textContent = "Processing what you said...";
+          startWatchdog();
           dataChannel.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
           return;
         }
@@ -1684,7 +1912,9 @@
           realtimeConversationInFlight = false;
           voiceIntakeStep = 0;
           voiceIntakeAnswers = {};
-          beginIntroAwaitingMood();
+          conversationHistory = [];
+          q3History = [];
+          startQuestioningPhase();
           pendingVoiceConfirmation = null;
           realtimeStatusEl.textContent = "Creating ephemeral Realtime session...";
           const tokenResp = await fetch("/api/realtime/session", { method: "POST" });
@@ -1700,7 +1930,7 @@
           dataChannel.onmessage = handleRealtimeEvent;
           dataChannel.onopen = () => {
             realtimeStatusEl.textContent =
-              "Realtime connected. Answer 3 questions: name, department, info to relay.";
+              "Smartie is ready. Please answer 2 questions to get your insights.";
             dataChannel.send(
               JSON.stringify({
                 type: "session.update",
@@ -1711,18 +1941,18 @@
                   turn_detection: {
                     type: "server_vad",
                     create_response: false,
-                    threshold: 0.6,
-                    prefix_padding_ms: 500,
-                    silence_duration_ms: 2000,
+                    threshold: 0.5,
+                    prefix_padding_ms: 600,
+                    silence_duration_ms: 3500,
                   },
                   input_audio_transcription: { model: "gpt-4o-mini-transcribe", language: "en" },
                 },
               })
             );
             realtimeStatusEl.textContent =
-              "Connected — speak naturally; I will detect when you finish.";
+              "Connected — Smartie is listening.";
             speakWithNaturalVoice(
-              "Hey! I've got just three quick questions for you, and before we start, how are you doing today?"
+              "Hi, Teachers Employee. I'm Smartie. I can help you explore our Enterprise Data for Insights. Before we get started, which business unit are you with?"
             );
           };
 
@@ -1762,6 +1992,7 @@
         if ((!peerConnection && !dataChannel) || realtimeIsStopping) {
           return;
         }
+        clearWatchdog();
         realtimeIsStopping = true;
         realtimeIsActive = false;
         realtimeAwaitingConversation = false;

@@ -276,9 +276,9 @@ def create_realtime_session():
                 "turn_detection": {
                     "type": "server_vad",
                     "create_response": False,
-                    "threshold": 0.6,
-                    "prefix_padding_ms": 500,
-                    "silence_duration_ms": 2000,
+                    "threshold": 0.5,
+                    "prefix_padding_ms": 600,
+                    "silence_duration_ms": 3500,
                 },
                 "input_audio_transcription": {
                     "model": "gpt-4o-mini-transcribe",
@@ -312,6 +312,170 @@ def create_realtime_session():
             "model": model,
         }
     )
+
+
+@app.post("/api/validate-query")
+def validate_query():
+    """
+    Uses OpenAI to assess if a query is specific and banking/credit union related.
+    Supports conversation history so vague follow-ups like 'do it for TFCU' can be
+    resolved from context. Returns valid, suggestion, and optional resolved_query.
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return _error("OPENAI_API_KEY is not configured on the server", status=500)
+
+    payload = request.get_json(silent=True) or {}
+    query = _sanitize_text(str(payload.get("query", "")))
+    business_unit = _sanitize_text(str(payload.get("business_unit", "")))
+    history = payload.get("history", [])
+    if not isinstance(history, list):
+        history = []
+    if not query:
+        return _error("query is required")
+
+    # Build history context string for the prompt
+    history_text = ""
+    if history:
+        history_lines = []
+        for turn in history[-10:]:
+            role = str(turn.get("role", "")).strip()
+            content = _sanitize_text(str(turn.get("content", "")))
+            if role and content:
+                history_lines.append(f"{role.capitalize()}: {content}")
+        if history_lines:
+            history_text = "\n\nConversation so far:\n" + "\n".join(history_lines)
+
+    model = os.getenv("OPENAI_TEXT_MODEL", "gpt-4.1-mini")
+    try:
+        response = _post_openai(
+            url="https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            body={
+                "model": model,
+                "input": [
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "You are validating data queries for Smartie, an enterprise data assistant "
+                                    "at Teachers Federal Credit Union (TFCU), a large US credit union. "
+                                    "IMPORTANT: Always assume all data queries are about Teachers Federal Credit Union "
+                                    "unless explicitly stated otherwise. If the user says 'do it for TFCU' or "
+                                    "'show me that' or any vague reference, use the conversation history to "
+                                    "resolve what they mean and return a fully resolved query.\n\n"
+                                    "Your job:\n"
+                                    "1. Check if the query (considering conversation history) is banking/credit union related\n"
+                                    "2. Check if it is specific enough to retrieve meaningful data\n"
+                                    "3. If vague but resolvable from history, resolve it and mark as valid\n\n"
+                                    "Respond ONLY with a valid JSON object, no prose, no markdown. Choose one:\n"
+                                    '{"valid": true} — query is good as-is\n'
+                                    '{"valid": true, "resolved_query": "..."} — query was vague but resolved from history\n'
+                                    '{"valid": false, "suggestion": "..."} — query is invalid; suggestion coaches the user\n\n'
+                                    "Suggestion rules:\n"
+                                    "- 1-2 sentences, conversational and warm\n"
+                                    "- Reference credit union concepts (loans, deposits, members, rates, delinquency, "
+                                    "branches, transactions, accounts, etc.)\n"
+                                    "- If previous coaching was given, build on it — don't repeat the same advice\n"
+                                    "- Do not invent table or column names\n"
+                                    "- End with a period, not a question mark\n"
+                                    "Never include markdown, code fences, or extra keys."
+                                    f"{history_text}"
+                                ),
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": f"Business unit: {business_unit or 'Teachers FCU'}\nQuery: {query}",
+                            }
+                        ],
+                    },
+                ],
+                "max_output_tokens": 250,
+            },
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        return _error(f"Failed to reach OpenAI: {exc}", status=502)
+
+    if not response.ok:
+        return jsonify({"valid": True})  # fail open so users aren't blocked
+
+    data = response.json()
+    raw = _extract_response_text(data)
+    try:
+        import json as _json
+        result = _json.loads(raw)
+        return jsonify(result)
+    except Exception:
+        return jsonify({"valid": True})  # fail open
+
+
+@app.post("/api/translate")
+def translate_text():
+    """
+    Translates any text to English using OpenAI.
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return _error("OPENAI_API_KEY is not configured on the server", status=500)
+
+    payload = request.get_json(silent=True) or {}
+    text = _sanitize_text(str(payload.get("text", "")))
+    if not text:
+        return _error("text is required")
+
+    model = os.getenv("OPENAI_TEXT_MODEL", "gpt-4.1-mini")
+    try:
+        response = _post_openai(
+            url="https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            body={
+                "model": model,
+                "input": [
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "Translate the following text to English. "
+                                    "Return only the translated text, nothing else. "
+                                    "If it is already in English, return it unchanged."
+                                ),
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                ],
+                "max_output_tokens": 200,
+            },
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        return _error(f"Failed to reach OpenAI translation API: {exc}", status=502)
+
+    if not response.ok:
+        return jsonify({"error": "Translation failed", "status_code": response.status_code}), 502
+
+    data = response.json()
+    translated = _extract_response_text(data)
+    return jsonify({"translated": translated or text})
 
 
 @app.post("/api/mood-response")
