@@ -265,24 +265,16 @@ def create_realtime_session():
 
     try:
         response = _post_openai(
-            url="https://api.openai.com/v1/realtime/sessions",
+            url="https://api.openai.com/v1/realtime/client_secrets",
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
             body={
-                "model": model,
-                "modalities": ["text"],
-                "turn_detection": {
-                    "type": "server_vad",
-                    "create_response": False,
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 600,
-                    "silence_duration_ms": 3500,
-                },
-                "input_audio_transcription": {
-                    "model": "gpt-4o-mini-transcribe",
-                },
+                "session": {
+                    "type": "realtime",
+                    "model": model,
+                }
             },
             timeout=20,
         )
@@ -302,14 +294,16 @@ def create_realtime_session():
         )
 
     data = response.json()
-    client_secret = ((data.get("client_secret") or {}).get("value")) if isinstance(data, dict) else None
+    # GA API returns the client secret object directly at the top level:
+    # { "value": "ek_...", "expires_at": ..., "session": {...} }
+    client_secret = data.get("value") if isinstance(data, dict) else None
     if not client_secret:
         return _error("Realtime session created but missing client secret", status=502)
 
     return jsonify(
         {
             "client_secret": client_secret,
-            "model": model,
+            "model": (data.get("session") or {}).get("model") or model,
         }
     )
 
@@ -475,7 +469,182 @@ def translate_text():
 
     data = response.json()
     translated = _extract_response_text(data)
-    return jsonify({"translated": translated or text})
+    # Return whether extraction succeeded so the frontend can distinguish
+    # a successful translation from a fallback
+    return jsonify({"translated": translated or "", "ok": bool(translated)})
+
+
+@app.post("/api/extract-answer")
+def extract_answer():
+    """
+    Uses AI to extract the core answer from natural language input.
+    "I said data" → "data", "can you show me metrics" → "metrics", etc.
+    Fails open — always returns something usable.
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return _error("OPENAI_API_KEY is not configured", status=500)
+
+    payload = request.get_json(silent=True) or {}
+    text = _sanitize_text(str(payload.get("text", "")))
+    step = int(payload.get("step", 0))
+
+    if not text:
+        return _error("text is required")
+
+    question_map = {
+        0: "Which business unit are you with?",
+        1: "What type of data are you looking for — metrics, trends, or reports?",
+        2: "What specific query would you like relayed to the data system?",
+    }
+    current_question = question_map.get(step, "What are you looking for?")
+
+    model = os.getenv("OPENAI_TEXT_MODEL", "gpt-4.1-mini")
+    try:
+        response = _post_openai(
+            url="https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            body={
+                "model": model,
+                "input": [
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    f"The user is being asked: \"{current_question}\"\n"
+                                    "Extract only the core answer from their response, "
+                                    "stripping any filler phrases like 'I said', 'I meant', "
+                                    "'can you show me', 'I want to see', 'give me', 'basically', etc. "
+                                    "If the input is already a clean answer, return it unchanged. "
+                                    "Return ONLY the extracted answer — no explanation, no punctuation changes."
+                                ),
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                ],
+                "max_output_tokens": 50,
+            },
+            timeout=3,
+        )
+    except requests.RequestException:
+        return jsonify({"extracted": text})  # fail open
+
+    if not response.ok:
+        return jsonify({"extracted": text})  # fail open
+
+    data = response.json()
+    extracted = _extract_response_text(data)
+    return jsonify({"extracted": extracted or text})
+
+
+@app.post("/api/bridge-interrupt")
+def bridge_interrupt():
+    """
+    Called when a user intentionally interrupts Smartie mid-speech.
+    Determines whether the interruption answers the current question,
+    and returns a bridging response that connects what they said to
+    the question being asked.
+    """
+    import json as _json
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return _error("OPENAI_API_KEY is not configured on the server", status=500)
+
+    payload = request.get_json(silent=True) or {}
+    interrupted_text = _sanitize_text(str(payload.get("interrupted_text", "")))
+    step = int(payload.get("step", 0))
+    answers_so_far = payload.get("answers_so_far", {})
+
+    if not interrupted_text:
+        return _error("interrupted_text is required")
+
+    question_map = {
+        0: "Which business unit are you with?",
+        1: "What type of data are you looking for — metrics, trends, or reports?",
+        2: "What specific query would you like relayed to the data system?",
+    }
+    current_question = question_map.get(step, "What are you looking for?")
+
+    answers_context = ""
+    if answers_so_far:
+        parts = []
+        for k, v in answers_so_far.items():
+            if v:
+                parts.append(f"{k}: {v}")
+        if parts:
+            answers_context = "\nAnswers already captured: " + ", ".join(parts)
+
+    system_prompt = (
+        "You are Smartie, a friendly and efficient voice intake assistant for "
+        "Teachers Federal Credit Union (TFCU). You were in the middle of asking "
+        "the user a question when they interrupted you.\n\n"
+        f"Question you were asking: {current_question}\n"
+        f"What the user said during the interruption: {interrupted_text}"
+        f"{answers_context}\n\n"
+        "Your job:\n"
+        "1. Decide if the user's statement contains a usable answer to the current question.\n"
+        "2. If YES: extract the answer cleanly and write a short bridge response that "
+        "confirms what you understood (1-2 sentences, warm, Smartie's voice).\n"
+        "3. If NO: write a short bridge response that acknowledges what they said and "
+        "smoothly redirects back to the current question (1-2 sentences).\n\n"
+        "Rules:\n"
+        "- Be concise and conversational — this is spoken aloud\n"
+        "- Do not repeat the full question verbatim if redirecting; just guide them back\n"
+        "- Always assume TFCU context\n"
+        "- Respond ONLY with valid JSON, no markdown, no prose outside the JSON\n\n"
+        "JSON format:\n"
+        '{"resolved": true, "extracted_answer": "...", "bridge_response": "..."}\n'
+        "or\n"
+        '{"resolved": false, "bridge_response": "..."}'
+    )
+
+    model = os.getenv("OPENAI_TEXT_MODEL", "gpt-4.1-mini")
+    try:
+        response = _post_openai(
+            url="https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            body={
+                "model": model,
+                "input": [
+                    {
+                        "role": "system",
+                        "content": [{"type": "input_text", "text": system_prompt}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": interrupted_text}],
+                    },
+                ],
+                "max_output_tokens": 200,
+            },
+            timeout=8,
+        )
+    except requests.RequestException as exc:
+        return _error(f"Failed to reach OpenAI: {exc}", status=502)
+
+    if not response.ok:
+        return jsonify({"resolved": False, "bridge_response": None})
+
+    data = response.json()
+    raw = _extract_response_text(data)
+    try:
+        result = _json.loads(raw)
+        return jsonify(result)
+    except Exception:
+        return jsonify({"resolved": False, "bridge_response": None})
 
 
 @app.post("/api/mood-response")

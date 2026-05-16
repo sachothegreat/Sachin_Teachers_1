@@ -615,10 +615,16 @@
       let realtimeIsStopping = false;
       let lastAutoCommitMs = 0;
       let lastTtsStartMs = 0;
+      let lastTtsEndedMs = 0;
+      // Short tail so we don't block users who answer the moment the bot stops talking.
+      // Browser-level echoCancellation handles most of the residual echo already.
+      const POST_TTS_GUARD_MS = 250;
       let speechStartedMs = 0;
-      const TTS_INTERRUPT_PROTECTION_MS = 2000;
+      const TTS_INTERRUPT_PROTECTION_MS = 1500;
       const MIN_SPEECH_DURATION_MS = 700;
       let ignoreNextSpeechStoppedCommit = false;
+      let ttsInterruptedByUser = false; // true when user spoke while TTS was playing
+      let pendingInterruptBridge = false; // true when next transcript should go through bridge handler
       let watchdogTimer = null;
       const WATCHDOG_TIMEOUT_MS = 8000; // re-ask if no response in 8s
       const INTRO_PHASE = {
@@ -654,6 +660,8 @@
       let voiceIntakeAnswers = {};
       let conversationHistory = []; // [{role:"assistant"|"user", content:"..."}]
       let q3History = [];          // Q3-specific attempt/coaching pairs (up to 10 entries)
+      let q2FollowupPending = false; // true when Q2 category detected and we need a follow-up clarification
+      let q2FollowupCategory = null;  // stores the detected category so we can re-ask on "no"
       const voiceAcknowledgments = ["Got it.", "Thanks.", "Perfect.", "Nice.", "Okay."];
       function randomVoiceAck() {
         return voiceAcknowledgments[Math.floor(Math.random() * voiceAcknowledgments.length)];
@@ -694,13 +702,29 @@
         if (nonAscii > 0 && letters < 4) return false;
         return true;
       }
+      function detectQ2Category(text) {
+        // Detects metric/trend/report anywhere in the answer
+        const t = String(text || "").toLowerCase();
+        if (/\bmetrics?\b/.test(t) || /\bkpis?\b/.test(t)) return "metric";
+        if (/\btrends?\b/.test(t)) return "trend";
+        if (/\breports?\b/.test(t)) return "report";
+        if (/\bdata\b|\banalytics\b|\binsights?\b/.test(t)) return "data";
+        return null;
+      }
+      function q2FollowupQuestion(category) {
+        if (category === "metric") return "What specific metrics are you looking for? For example, loan volume, member counts, or deposit balances?";
+        if (category === "trend") return "What kind of trends? For example, growth over time, or month over month changes?";
+        if (category === "report") return "What type of report — a summary, branch breakdown, or performance overview?";
+        if (category === "data") return "What specific data are you after? Like loan figures, member stats, or something else?";
+        return "Can you be a bit more specific about what you are looking for?";
+      }
       function getStepLabel(step) {
         return `${Math.min(step + 1, voiceIntakeQuestions.length)}/${voiceIntakeQuestions.length}`;
       }
       function beginIntroAwaitingMood() {
         introTurnId += 1;
         introPhase = INTRO_PHASE.AWAITING_USER_MOOD;
-        introCommitHoldUntilMs = Date.now() + 1200;
+        introCommitHoldUntilMs = Date.now() + 600;
       }
       function startQuestioningPhase() {
         introPhase = INTRO_PHASE.QUESTIONING;
@@ -728,7 +752,7 @@
         }
         return "Thanks for sharing. I'll keep this simple and guide you through three quick questions.";
       }
-      async function fetchIntroAcknowledgmentWithTimeout(userText, timeoutMs = 3500) {
+      async function fetchIntroAcknowledgmentWithTimeout(userText, timeoutMs = 2000) {
         const timeoutPromise = new Promise((_, reject) => {
           setTimeout(() => reject(new Error("mood_ack_timeout")), timeoutMs);
         });
@@ -743,15 +767,40 @@
           });
           if (!response.ok) return null;
           const data = await response.json();
-          return data.translated || null;
+          // Only return the translation if the backend confirmed extraction succeeded
+          return (data.ok && data.translated) ? data.translated : null;
         } catch (_) {
           return null;
         }
       }
 
+      async function bridgeInterrupt(interruptedText, step, answersSoFar) {
+        const timeout = new Promise(resolve =>
+          setTimeout(() => resolve({ resolved: false, bridge_response: null }), 4000)
+        );
+        const fetchCall = (async () => {
+          try {
+            const response = await fetch("/api/bridge-interrupt", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                interrupted_text: interruptedText,
+                step,
+                answers_so_far: answersSoFar,
+              }),
+            });
+            if (!response.ok) return { resolved: false, bridge_response: null };
+            return await response.json();
+          } catch (_) {
+            return { resolved: false, bridge_response: null };
+          }
+        })();
+        return Promise.race([fetchCall, timeout]);
+      }
+
       async function validateBankingQuery(query, businessUnit = "", historyOverride = null) {
         const timeout = new Promise(resolve =>
-          setTimeout(() => resolve({ valid: true }), 5000) // fail open after 5s
+          setTimeout(() => resolve({ valid: true }), 3000) // fail open after 3s
         );
         const fetchCall = (async () => {
           try {
@@ -776,13 +825,26 @@
         return Promise.race([fetchCall, timeout]);
       }
 
-      function startWatchdog() {
+      function startWatchdog(delayMs = WATCHDOG_TIMEOUT_MS) {
         clearWatchdog();
         watchdogTimer = setTimeout(() => {
           if (!realtimeIsActive || intentSubmitted) return;
+          // Don't interrupt if we're waiting for a yes/no confirmation
+          if (pendingVoiceConfirmation) return;
+          // Don't interrupt if TTS is currently playing
+          if (!assistantAudioEl.paused) return;
+          // Don't interrupt if TTS finished very recently (still processing)
+          if (Date.now() - lastTtsStartMs < 3000) return;
           realtimeStatusEl.textContent = "Smartie is ready — please go ahead.";
           askCurrentVoiceQuestion();
-        }, WATCHDOG_TIMEOUT_MS);
+        }, delayMs);
+      }
+      // Called when a transcript was silently discarded after a commit — reset status
+      // and re-prompt quickly so the user isn't stuck staring at "Processing..."
+      function onSilentDiscard() {
+        if (pendingVoiceConfirmation) return; // in a confirmation flow, leave it alone
+        realtimeStatusEl.textContent = "Didn't catch that — please go ahead.";
+        startWatchdog(3000); // re-ask in 3s if user doesn't speak again
       }
       function clearWatchdog() {
         if (watchdogTimer) {
@@ -800,6 +862,29 @@
         // Very short single characters — not real speech
         if (t.length < 2) return true;
         return false;
+      }
+
+      async function extractCoreAnswer(text, step) {
+        // Calls AI to extract the core answer from natural language input.
+        // "I said data" → "data", "can you show me metrics" → "metrics", etc.
+        // Fails open — returns original text if anything goes wrong or times out.
+        const original = String(text || "").trim();
+        const timeout = new Promise(resolve => setTimeout(() => resolve(original), 2500));
+        const fetchCall = (async () => {
+          try {
+            const response = await fetch("/api/extract-answer", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ text: original, step }),
+            });
+            if (!response.ok) return original;
+            const data = await response.json();
+            return (data.extracted && data.extracted.trim()) ? data.extracted.trim() : original;
+          } catch (_) {
+            return original;
+          }
+        })();
+        return Promise.race([fetchCall, timeout]);
       }
 
       function isValidExplorationQuery(text) {
@@ -832,14 +917,16 @@
         );
       }
       function isNoConfirmation(transcript) {
-        const t = String(transcript || "").toLowerCase();
+        const t = String(transcript || "").toLowerCase().trim();
         return (
           t === "no" ||
           t === "nope" ||
           t === "nah" ||
           t === "incorrect" ||
           t === "wrong" ||
-          t.includes("no") ||
+          t === "not right" ||
+          t === "not correct" ||
+          /^no[,.\s]/.test(t) ||  // "no," or "no." at start but not "notice", "novel" etc.
           t.includes("wrong")
         );
       }
@@ -864,7 +951,11 @@
         try {
           const combined = await navigator.mediaDevices.getUserMedia({
             video: true,
-            audio: true,
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
           });
           mediaStream = combined;
           cameraPreviewEl.srcObject = combined;
@@ -877,7 +968,13 @@
         }
 
         try {
-          mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+          });
         } catch (audioError) {
           cameraStatusEl.textContent = "Camera not started.";
           microphoneStatusEl.textContent = `Microphone access blocked: ${audioError.message}`;
@@ -1378,6 +1475,7 @@
             if (thisSpeakJobId !== speakJobId) {
               return;
             }
+            lastTtsEndedMs = Date.now();
             if (currentTtsUrl === url) {
               URL.revokeObjectURL(url);
               currentTtsUrl = null;
@@ -1499,6 +1597,11 @@
           // Ignore noisy empty-buffer commit errors in the UI.
           return;
         }
+        if (msg.type === "error" && msg.error) {
+          console.error("Realtime error event:", msg.error);
+          const detail = msg.error.message || msg.error.code || "unknown error";
+          realtimeStatusEl.textContent = `Realtime error: ${detail}`;
+        }
         console.log("RAW RESPONSE:", msg);
         realtimeDebugEl.textContent = JSON.stringify(msg, null, 2);
 
@@ -1509,13 +1612,42 @@
           clearWatchdog();
           const rawTranscript = String(msg.transcript || "").trim();
           const transcript = rawTranscript.toLowerCase();
-          if (!rawTranscript) {
+          // Echo guard: if the bot is currently speaking TTS OR finished
+          // less than POST_TTS_GUARD_MS ago, drop this transcript — it is
+          // almost certainly the mic picking up the bot's own voice. We
+          // can't process it as the user's answer or the bot starts a
+          // self-driven loop ("please say yes or no" right after asking
+          // a question, etc.). Exceptions:
+          //   - the user genuinely interrupted TTS (ttsInterruptedByUser)
+          //   - we're awaiting a yes/no confirmation AND the transcript
+          //     looks like a short yes/no — that's a real user reply, not
+          //     echo (bot echo would be longer because it includes the
+          //     surrounding phrase). Without this exception, a quick "yes"
+          //     said right after the bot finishes the confirmation TTS
+          //     gets dropped and the user is stuck.
+          const nowMs = Date.now();
+          const ttsCurrentlyPlaying = !assistantAudioEl.paused && nowMs > lastTtsStartMs;
+          const inPostTtsTailWindow = lastTtsEndedMs > 0 && nowMs - lastTtsEndedMs < POST_TTS_GUARD_MS;
+          const looksLikeShortConfirmation =
+            rawTranscript.length <= 12 &&
+            (isYesConfirmation(transcript) || isNoConfirmation(transcript));
+          const confirmationException = pendingVoiceConfirmation && looksLikeShortConfirmation;
+          if (
+            (ttsCurrentlyPlaying || inPostTtsTailWindow) &&
+            !ttsInterruptedByUser &&
+            !confirmationException
+          ) {
+            console.log("Echo guard: dropping transcript while bot speaking:", rawTranscript);
             return;
           }
-          // Silently discard noise transcripts — but never during yes/no confirmation
-          // since "yes", "no", "yeah" etc. are short and would get wrongly filtered
+          if (!rawTranscript) {
+            onSilentDiscard();
+            return;
+          }
+          // Silently discard noise transcripts — just return, don't re-ask out loud
+          // (the bot is already speaking or has just asked; re-asking creates a loop)
           if (!pendingVoiceConfirmation && isNoisyTranscript(rawTranscript)) {
-            askCurrentVoiceQuestion();
+            onSilentDiscard();
             return;
           }
           if (
@@ -1525,19 +1657,20 @@
             // Ignore extra transcript events while acknowledgment is being produced/spoken.
             return;
           }
-          if (!isLikelyEnglish(rawTranscript)) {
+          // Only attempt translation once — if this event was already translated, skip
+          if (!isLikelyEnglish(rawTranscript) && !msg._alreadyTranslated) {
             realtimeStatusEl.textContent = "Translating your response...";
             const translated = await translateText(rawTranscript);
             if (!translated) {
-              askCurrentVoiceQuestion("I had trouble understanding that. Please try again.");
+              // Translation failed — ask the user to try again
+              speakWithNaturalVoice("I had a little trouble with that. Could you try again?");
               return;
             }
             realtimeStatusEl.textContent = `Translated: "${translated}"`;
-            // Re-inject as English and fall through to normal processing
-            msg._translatedTranscript = translated;
-            // Re-dispatch with translated text by mutating rawTranscript reference
+            // Re-dispatch with translated text; _alreadyTranslated prevents re-translation loops
             const translatedEvent = new MessageEvent("message", { data: JSON.stringify({
               ...msg,
+              _alreadyTranslated: true,
               type: "conversation.item.input_audio_transcription.completed",
               transcript: translated,
             })});
@@ -1561,7 +1694,7 @@
               return;
             }
             introPhase = INTRO_PHASE.ACK_SPEAKING;
-            introCommitHoldUntilMs = Date.now() + 1100;
+            introCommitHoldUntilMs = Date.now() + 600;
             speakWithNaturalVoice(acknowledgment, () => {
               if (!realtimeIsActive || thisTurnId !== introTurnId) {
                 return;
@@ -1576,7 +1709,7 @@
           }
           if (pendingVoiceConfirmation) {
             if (isYesConfirmation(transcript)) {
-              const { key, value, step, validation } = pendingVoiceConfirmation;
+              const { key, value, step, validation, isFollowup } = pendingVoiceConfirmation;
               // Q3: check if background validation is done and failed
               if (step === 2) {
                 if (validation === null) {
@@ -1593,13 +1726,34 @@
                   return;
                 }
               }
+              // Grab rawInput before clearing pendingVoiceConfirmation
+              const rawInput = pendingVoiceConfirmation ? pendingVoiceConfirmation.rawInput : null;
               voiceIntakeAnswers[key] = value;
               pendingVoiceConfirmation = null;
-              voiceIntakeStep = step + 1;
               // Q3 confirmed — clear the Q3-specific history
               if (step === 2) {
                 q3History = [];
               }
+              // Q2 confirmed — handle follow-up confirmation or initial category detection
+              if (step === 1) {
+                if (isFollowup) {
+                  // Follow-up answer confirmed — advance to Q3
+                  q2FollowupCategory = null;
+                  voiceIntakeStep = 2;
+                  realtimeStatusEl.textContent = `Captured (Q2): ${shortEcho(value)}`;
+                  askCurrentVoiceQuestion("Perfect. And lastly,");
+                  return;
+                }
+                const category = detectQ2Category(rawInput || value);
+                if (category) {
+                  q2FollowupCategory = category;
+                  q2FollowupPending = true;
+                  realtimeStatusEl.textContent = "Asking follow-up on Q2...";
+                  speakWithNaturalVoice(q2FollowupQuestion(category));
+                  return;
+                }
+              }
+              voiceIntakeStep = step + 1;
               if (voiceIntakeStep >= voiceIntakeQuestions.length) {
                 const echo = shortEcho(value);
                 if (echo) {
@@ -1617,8 +1771,19 @@
               return;
             }
             if (isNoConfirmation(transcript)) {
-              const { step } = pendingVoiceConfirmation;
+              const { step, isFollowup } = pendingVoiceConfirmation;
               pendingVoiceConfirmation = null;
+              if (step === 1 && isFollowup) {
+                // Re-ask the follow-up question, not the whole Q2
+                q2FollowupPending = true;
+                realtimeStatusEl.textContent = "Re-asking follow-up...";
+                speakWithNaturalVoice(q2FollowupQuestion(q2FollowupCategory || "report"));
+                return;
+              }
+              // Q3: remove the rejected attempt from history so validation context stays clean
+              if (step === 2 && q3History.length > 0) {
+                q3History.pop();
+              }
               realtimeStatusEl.textContent = "No problem, let's try that answer again.";
               askCurrentVoiceQuestion(`Got it. Let's retry question ${getStepLabel(step)}.`);
               return;
@@ -1635,6 +1800,9 @@
             voiceIntakeStep = 0;
             voiceIntakeAnswers = {};
             q3History = [];
+            q2FollowupPending = false;
+            q2FollowupCategory = null;
+            pendingInterruptBridge = false;
             startQuestioningPhase();
             pendingVoiceConfirmation = null;
             realtimeStatusEl.textContent = "Starting over from question 1.";
@@ -1647,8 +1815,8 @@
             return;
           }
           if (rawTranscript.length < 2) {
-            askCurrentVoiceQuestion("I didn't quite catch that.");
-            return;
+            onSilentDiscard();
+            return; // too short to be real speech — silently discard
           }
           if (transcript.includes("done") || transcript.includes("stop")) {
             if (voiceIntakeStep >= voiceIntakeQuestions.length) {
@@ -1661,6 +1829,63 @@
             return;
           }
 
+          // Intentional TTS interruption — bridge what they said back to the current question
+          if (pendingInterruptBridge) {
+            pendingInterruptBridge = false;
+            const bridgeStep = voiceIntakeStep;
+            realtimeStatusEl.textContent = "Smartie: picking up what you said...";
+            const bridgeResult = await bridgeInterrupt(rawTranscript, bridgeStep, voiceIntakeAnswers);
+            if (!realtimeIsActive) return;
+            if (bridgeResult.resolved && bridgeResult.extracted_answer) {
+              // LLM extracted a usable answer — pre-fill and ask user to confirm
+              const extracted = bridgeResult.extracted_answer;
+              const key = voiceIntakeKeys[bridgeStep];
+              pendingVoiceConfirmation = { key, value: extracted, step: bridgeStep, validation: null };
+              realtimeStatusEl.textContent = `Confirming (${getStepLabel(bridgeStep)}): ${shortEcho(extracted)}`;
+              // Always explicitly ask for yes/no — never rely on LLM to include it
+              const ack = bridgeResult.bridge_response
+                ? `${bridgeResult.bridge_response.replace(/[.!?]+$/, "")}. Is that correct? Please say yes or no.`
+                : `Got it — I heard "${shortEcho(extracted)}". Is that correct? Please say yes or no.`;
+              if (bridgeStep === 2) {
+                q3History.push({ role: "user", content: rawTranscript });
+                validateBankingQuery(extracted, voiceIntakeAnswers.business_unit || "", q3History).then(result => {
+                  if (pendingVoiceConfirmation && pendingVoiceConfirmation.value === extracted) {
+                    if (result.resolved_query) pendingVoiceConfirmation.value = result.resolved_query;
+                    pendingVoiceConfirmation.validation = result;
+                  }
+                });
+              }
+              speakWithNaturalVoice(ack);
+            } else {
+              // LLM couldn't extract an answer — acknowledge and re-ask current question
+              const ack = bridgeResult.bridge_response
+                ? `${bridgeResult.bridge_response.replace(/[.!?]+$/, "")}. ` : "";
+              askCurrentVoiceQuestion(ack || "Let me re-ask —");
+            }
+            return;
+          }
+
+          // If we asked a Q2 follow-up, confirm the answer with yes/no before
+          // advancing. The existing pendingVoiceConfirmation yes-branch with
+          // isFollowup: true will move us on to Q3 once the user confirms.
+          if (q2FollowupPending) {
+            q2FollowupPending = false;
+            const combined = `${voiceIntakeAnswers.summary}, specifically ${rawTranscript}`;
+            conversationHistory.push({ role: "user", content: rawTranscript });
+            pendingVoiceConfirmation = {
+              key: "summary",
+              value: combined,
+              step: 1,
+              isFollowup: true,
+              rawInput: rawTranscript,
+              validation: null,
+            };
+            realtimeStatusEl.textContent = `Confirming follow-up: ${shortEcho(rawTranscript)}`;
+            speakWithNaturalVoice(
+              `I heard "${ttsEcho(rawTranscript)}". Is that correct? Please say yes or no.`
+            );
+            return;
+          }
           const step = voiceIntakeStep;
           const key = voiceIntakeKeys[step];
           if (!key) {
@@ -1673,25 +1898,67 @@
             );
             return;
           }
-          // Respond immediately for all steps — same response time across Q1, Q2, Q3
+          // Q2 category fast-path: when the first answer is a clear category
+          // (e.g. "reports", "metrics", "trends"), skip the yes/no confirmation
+          // and go straight into acknowledgment + follow-up question in one breath.
+          // The follow-up answer itself still goes through normal confirmation.
+          if (step === 1) {
+            const category = detectQ2Category(rawTranscript);
+            if (category) {
+              conversationHistory.push({ role: "user", content: rawTranscript });
+              voiceIntakeAnswers[key] = rawTranscript;
+              q2FollowupCategory = category;
+              q2FollowupPending = true;
+              const ackWord = shortEcho(rawTranscript);
+              realtimeStatusEl.textContent = `Captured (Q2): ${ackWord} — asking follow-up...`;
+              speakWithNaturalVoice(`Got it, ${ttsEcho(rawTranscript)}. ${q2FollowupQuestion(category)}`);
+              return;
+            }
+          }
+          // Respond immediately — set confirmation with raw transcript right away
+          // AI extraction runs in background and updates the value before user says yes
           if (step === 2) {
-            // Track Q3 attempts separately so the validator remembers the full Q3 history
             q3History.push({ role: "user", content: rawTranscript });
           } else {
             conversationHistory.push({ role: "user", content: rawTranscript });
           }
-          pendingVoiceConfirmation = { key, value: rawTranscript, step, validation: null };
+          // rawTranscript stored as rawInput so vagueness checks always use original speech
+          pendingVoiceConfirmation = { key, value: rawTranscript, step, validation: null, rawInput: rawTranscript };
           const echo = shortEcho(rawTranscript);
           const spokenEcho = ttsEcho(rawTranscript);
           realtimeStatusEl.textContent = `Confirming (${getStepLabel(step)}): ${echo}`;
           speakWithNaturalVoice(`I heard "${spokenEcho}". Is that correct? Please say yes or no.`);
-          // For Q3, kick off validation in the background while user confirms
+          // Background: AI extraction only for Q3 — Q1/Q2 answers are short and don't need it,
+          // and running it on every step adds a concurrent API call that delays TTS
+          if (step === 2) {
+            extractCoreAnswer(rawTranscript, step).then(coreAnswer => {
+              if (pendingVoiceConfirmation && pendingVoiceConfirmation.rawInput === rawTranscript) {
+                if (coreAnswer && coreAnswer !== rawTranscript) {
+                  // Only use extraction if it didn't drop significant content (just stripped filler).
+                  // Guard: extracted answer must be at least 70% of original word count.
+                  const origWords = rawTranscript.trim().split(/\s+/).length;
+                  const coreWords = coreAnswer.trim().split(/\s+/).length;
+                  if (coreWords >= Math.ceil(origWords * 0.7)) {
+                    pendingVoiceConfirmation.value = coreAnswer;
+                    realtimeStatusEl.textContent = `Confirming (${getStepLabel(step)}): ${shortEcho(coreAnswer)}`;
+                  }
+                }
+              }
+            });
+          }
+          // Background: Q3 validation
           if (step === 2) {
             validateBankingQuery(rawTranscript, voiceIntakeAnswers.business_unit || "", q3History).then(result => {
-              if (pendingVoiceConfirmation && pendingVoiceConfirmation.value === rawTranscript) {
-                // Use resolved query from AI if it clarified a vague input from context
+              if (pendingVoiceConfirmation) {
                 if (result.resolved_query) {
-                  pendingVoiceConfirmation.value = result.resolved_query;
+                  // Only use resolved_query if it adds specificity (≥ original word count).
+                  // This prevents the LLM from silently dropping details like time ranges
+                  // ("6 months", "Q1 2024") when it simplifies a specific query.
+                  const origWords = rawTranscript.trim().split(/\s+/).length;
+                  const resolvedWords = result.resolved_query.trim().split(/\s+/).length;
+                  if (resolvedWords >= origWords) {
+                    pendingVoiceConfirmation.value = result.resolved_query;
+                  }
                 }
                 pendingVoiceConfirmation.validation = result;
               }
@@ -1704,7 +1971,8 @@
           speechStartedMs = Date.now();
           realtimeStatusEl.textContent = "Listening...";
           const ttsAge = Date.now() - lastTtsStartMs;
-          if (ttsAge > TTS_INTERRUPT_PROTECTION_MS) {
+          const ttsIsPlaying = !assistantAudioEl.paused && ttsAge > 0;
+          if (ttsAge > TTS_INTERRUPT_PROTECTION_MS && ttsIsPlaying) {
             try {
               assistantAudioEl.pause();
               assistantAudioEl.currentTime = 0;
@@ -1715,6 +1983,7 @@
                 currentTtsUrl = null;
               }
               speakJobId += 1;
+              ttsInterruptedByUser = true; // bypass debounce for this speech
             } catch (_) {}
           }
           return;
@@ -1735,15 +2004,55 @@
           const speechDuration = Date.now() - speechStartedMs;
           if (speechDuration < MIN_SPEECH_DURATION_MS) {
             dataChannel.send(JSON.stringify({ type: "input_audio_buffer.clear" }));
+            ttsInterruptedByUser = false;
+            // Don't leave the status stuck on "Listening..." — reset it so the
+            // user sees the bot is ready for them to try again.
+            if (realtimeStatusEl.textContent === "Listening...") {
+              realtimeStatusEl.textContent = "Didn't catch that — please try again.";
+            }
             return;
           }
           const now = Date.now();
-          if (now < introCommitHoldUntilMs) {
-            return;
+          // If the user interrupted TTS, skip debounce and hold — their speech must go through
+          if (!ttsInterruptedByUser) {
+            // Echo guard: audio captured while the bot is speaking — OR within
+            // a short window after TTS just ended — is almost certainly echo /
+            // room pickup of the assistant's own voice. Clear the buffer
+            // instead of committing so we don't transcribe it and treat it
+            // as the user's answer.
+            //
+            // EXCEPTION: when we're waiting for a yes/no confirmation, let the
+            // commit through so the user's quick "yes" / "no" reply still
+            // gets transcribed. The transcription handler will do its own
+            // echo check on the text before acting on it.
+            const ttsIsPlaying = !assistantAudioEl.paused && now > lastTtsStartMs;
+            const inPostTtsTail = lastTtsEndedMs > 0 && now - lastTtsEndedMs < POST_TTS_GUARD_MS;
+            if ((ttsIsPlaying || inPostTtsTail) && !pendingVoiceConfirmation) {
+              dataChannel.send(JSON.stringify({ type: "input_audio_buffer.clear" }));
+              if (realtimeStatusEl.textContent === "Listening...") {
+                realtimeStatusEl.textContent = "Please wait until I finish speaking, then try again.";
+              }
+              return;
+            }
+            if (now < introCommitHoldUntilMs) {
+              if (realtimeStatusEl.textContent === "Listening...") {
+                realtimeStatusEl.textContent = "Just a moment...";
+              }
+              return;
+            }
+            if (now - lastAutoCommitMs < 1200) {
+              if (realtimeStatusEl.textContent === "Listening...") {
+                realtimeStatusEl.textContent = "Still processing — one moment.";
+              }
+              return;
+            }
           }
-          if (now - lastAutoCommitMs < 1500) {
-            return;
+          // If the interruption was long enough to be intentional and not a confirmation reply,
+          // flag the next transcript for bridge processing
+          if (ttsInterruptedByUser && speechDuration >= 800 && !pendingVoiceConfirmation && !q2FollowupPending) {
+            pendingInterruptBridge = true;
           }
+          ttsInterruptedByUser = false;
           lastAutoCommitMs = now;
           realtimeStatusEl.textContent = "Processing what you said...";
           startWatchdog();
@@ -1877,7 +2186,8 @@
           JSON.stringify({
             type: "response.create",
             response: {
-              modalities: ["text"],
+              // GA field name: output_modalities (renamed from beta `modalities`).
+              output_modalities: ["text"],
               instructions:
                 "Convert the spoken request into one JSON object only. No prose or markdown. " +
                 'Return all keys exactly: {"requestor_name":"Business Leader","business_unit":"Lending","summary":"...","priority":"low|medium|high|urgent","metric":"...","time_period":"...","confidence":0.0,"filters":{},"details":"...","source":"openai_realtime"}',
@@ -1914,12 +2224,26 @@
           voiceIntakeAnswers = {};
           conversationHistory = [];
           q3History = [];
+          q2FollowupPending = false;
+          q2FollowupCategory = null;
+          pendingInterruptBridge = false;
           startQuestioningPhase();
           pendingVoiceConfirmation = null;
           realtimeStatusEl.textContent = "Creating ephemeral Realtime session...";
-          const tokenResp = await fetch("/api/realtime/session", { method: "POST" });
+          let tokenResp = await fetch("/api/realtime/session", { method: "POST" });
+          // Auto-retry once on 5xx — transient OpenAI outages are common
+          if (!tokenResp.ok && tokenResp.status >= 500) {
+            realtimeStatusEl.textContent = "Session error — retrying in 2s...";
+            await new Promise(r => setTimeout(r, 2000));
+            tokenResp = await fetch("/api/realtime/session", { method: "POST" });
+          }
           if (!tokenResp.ok) {
-            throw new Error(`Session endpoint failed (${tokenResp.status})`);
+            let detail = "";
+            try {
+              const errData = await tokenResp.json();
+              detail = errData.details || errData.error || "";
+            } catch (_) {}
+            throw new Error(`Session endpoint failed (${tokenResp.status})${detail ? ": " + detail : ""}`);
           }
           const tokenData = await tokenResp.json();
           const ephemeralKey = tokenData.client_secret;
@@ -1928,24 +2252,47 @@
           peerConnection = new RTCPeerConnection();
           dataChannel = peerConnection.createDataChannel("oai-events");
           dataChannel.onmessage = handleRealtimeEvent;
+          peerConnection.onconnectionstatechange = () => {
+            const state = peerConnection?.connectionState;
+            console.log("WebRTC connectionState:", state);
+            if (state === "failed" || state === "closed" || state === "disconnected") {
+              realtimeStatusEl.textContent = `Realtime stopped (WebRTC ${state}).`;
+              stopRealtime();
+            }
+          };
+
+          dataChannel.onclose = () => {
+            console.log("DataChannel closed");
+            if (realtimeIsActive) {
+              realtimeStatusEl.textContent = "Realtime stopped (DataChannel closed).";
+              stopRealtime();
+            }
+          };
+
           dataChannel.onopen = () => {
             realtimeStatusEl.textContent =
               "Smartie is ready. Please answer 2 questions to get your insights.";
+            // GA schema: turn_detection and transcription live under audio.input.
+            // (Beta path session.turn_detection / session.input_audio_transcription
+            // is rejected silently and leaves the model with default VAD + no
+            // transcription, which looked like "stuck, not listening".)
             dataChannel.send(
               JSON.stringify({
                 type: "session.update",
                 session: {
-                  modalities: ["text"],
-                  instructions:
-                    "Use English only. Ask follow-up questions in English. If the user speaks a different language, politely ask them to continue in English.",
-                  turn_detection: {
-                    type: "server_vad",
-                    create_response: false,
-                    threshold: 0.5,
-                    prefix_padding_ms: 600,
-                    silence_duration_ms: 3500,
+                  type: "realtime",
+                  audio: {
+                    input: {
+                      turn_detection: {
+                        type: "server_vad",
+                        create_response: false,
+                        threshold: 0.65,
+                        prefix_padding_ms: 400,
+                        silence_duration_ms: 1800,
+                      },
+                      transcription: { model: "whisper-1", language: "en" },
+                    },
                   },
-                  input_audio_transcription: { model: "gpt-4o-mini-transcribe", language: "en" },
                 },
               })
             );
@@ -1963,7 +2310,9 @@
           const offer = await peerConnection.createOffer();
           await peerConnection.setLocalDescription(offer);
 
-          const sdpResponse = await fetch(`https://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`, {
+          // GA endpoint (replaces beta /v1/realtime?model=...). Model is
+          // already baked into the ephemeral key from /v1/realtime/client_secrets.
+          const sdpResponse = await fetch("https://api.openai.com/v1/realtime/calls", {
             method: "POST",
             headers: {
               Authorization: `Bearer ${ephemeralKey}`,
@@ -1973,7 +2322,9 @@
           });
 
           if (!sdpResponse.ok) {
-            throw new Error(`OpenAI SDP handshake failed (${sdpResponse.status})`);
+            const errBody = await sdpResponse.text().catch(() => "");
+            console.error("SDP handshake failed", sdpResponse.status, errBody);
+            throw new Error(`OpenAI SDP handshake failed (${sdpResponse.status})${errBody ? ": " + errBody.slice(0, 200) : ""}`);
           }
 
           const answerSdp = await sdpResponse.text();
