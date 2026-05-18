@@ -1703,9 +1703,24 @@
           const nowMs = Date.now();
           const ttsCurrentlyPlaying = !assistantAudioEl.paused && nowMs > lastTtsStartMs;
           const inPostTtsTailWindow = lastTtsEndedMs > 0 && nowMs - lastTtsEndedMs < POST_TTS_GUARD_MS;
+          // Only treat a transcript as a real yes/no reply if it is an EXACT
+          // short confirmation word — not just any phrase that happens to
+          // contain "yes" or "no". Otherwise echo of the bot's own
+          // "...is that correct? please say yes or no" tail gets transcribed,
+          // matches isYesConfirmation (which does t.includes("yes")), passes
+          // through the echo guard, and is processed as a user "yes" — which
+          // then triggers the Q3 validator's coaching reply ("give me more
+          // details...") even though the user never spoke.
+          const cleanedShort = transcript.replace(/[.,!?'"`]/g, " ").replace(/\s+/g, " ").trim();
+          const EXACT_YES = new Set([
+            "yes", "yeah", "yep", "yup", "correct", "right", "thats right", "that's right",
+          ]);
+          const EXACT_NO = new Set([
+            "no", "nope", "nah", "incorrect", "wrong", "not right", "not correct",
+          ]);
           const looksLikeShortConfirmation =
-            rawTranscript.length <= 12 &&
-            (isYesConfirmation(transcript) || isNoConfirmation(transcript));
+            rawTranscript.length <= 16 &&
+            (EXACT_YES.has(cleanedShort) || EXACT_NO.has(cleanedShort));
           const confirmationException = pendingVoiceConfirmation && looksLikeShortConfirmation;
           if (
             (ttsCurrentlyPlaying || inPostTtsTailWindow) &&
