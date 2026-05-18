@@ -498,12 +498,6 @@
           </div>
           <div class="page-header-text">
             <h1>Hi, I'm <span>Syntheia</span></h1>
-            <p class="lede muted">
-              I can help you explore our Enterprise Data for Insights.
-            </p>
-            <p class="lede muted">
-              Ask me about any metrics, trends, or reports across your business units.
-            </p>
           </div>
         </div>
       </header>
@@ -524,8 +518,8 @@
           <button type="button" id="stop-speaking" class="secondary" disabled>Stop &amp; re-ask</button>
           <button type="button" id="start-typed-intake" class="secondary">Type intent instead</button>
         </div>
-        <pre id="realtime-json" class="panel-pre muted">(structured ticket preview appears here)</pre>
-        <pre id="realtime-debug" class="panel-pre muted">(raw realtime event debug appears here)</pre>
+        <div id="realtime-json" style="max-height:260px;overflow-y:auto;font-size:0.85rem;line-height:1.6;padding:8px 0;display:flex;flex-direction:column;gap:4px;"></div>
+        <pre id="realtime-debug" class="panel-pre muted" style="display:none;"></pre>
         <div id="typed-intake-panel" class="card card-inset" style="display: none;">
           <h3>Typed intent intake</h3>
           <p id="typed-question" class="muted"></p>
@@ -586,6 +580,16 @@
       const realtimeStatusEl = document.getElementById("realtime-status");
       const realtimeJsonEl = document.getElementById("realtime-json");
       const realtimeDebugEl = document.getElementById("realtime-debug");
+      function appendTranscript(role, text) {
+        const line = document.createElement("div");
+        line.style.cssText = role === "You"
+          ? "color:#f1f5f9;text-align:right;background:rgba(14,165,233,0.12);border-radius:8px;padding:4px 10px;align-self:flex-end;max-width:85%;"
+          : "color:#94a3b8;text-align:left;background:rgba(255,255,255,0.04);border-radius:8px;padding:4px 10px;align-self:flex-start;max-width:85%;";
+        line.textContent = (role === "You" ? "You: " : "Syntheia: ") + text;
+        realtimeJsonEl.appendChild(line);
+        realtimeJsonEl.scrollTop = realtimeJsonEl.scrollHeight;
+      }
+      function clearTranscript() { realtimeJsonEl.innerHTML = ""; }
       const startRealtimeBtn = document.getElementById("start-realtime");
       const stopSpeakingBtn = document.getElementById("stop-speaking");
       const startTypedIntakeBtn = document.getElementById("start-typed-intake");
@@ -1398,7 +1402,7 @@
           source: "typed_intake",
         };
 
-        realtimeJsonEl.textContent = JSON.stringify(finalPayload, null, 2);
+        // transcript panel shows conversation, not JSON
         realtimeStatusEl.textContent = "Please hold on while I fetch you the results...";
         try {
           await submitStructuredTicket(finalPayload);
@@ -1519,6 +1523,7 @@
       }
 
       async function speakWithNaturalVoice(text, onEnd) {
+        appendTranscript("Syntheia", text);
         const audio = assistantAudioEl;
         const thisSpeakJobId = ++speakJobId;
         try {
@@ -1599,7 +1604,7 @@
         const question = voiceIntakeQuestions[voiceIntakeStep];
         const spoken = acknowledgment ? `${acknowledgment} ${question}` : question;
         realtimeStatusEl.textContent = `Assistant (${getStepLabel(voiceIntakeStep)}): ${question}`;
-        realtimeJsonEl.textContent = question;
+        // transcript logged via speakWithNaturalVoice
         speakWithNaturalVoice(spoken);
       }
 
@@ -1640,7 +1645,7 @@
           source: "openai_realtime",
         };
 
-        realtimeJsonEl.textContent = JSON.stringify(payload, null, 2);
+        // transcript panel shows conversation, not JSON
         realtimeStatusEl.textContent = "Fetching your results...";
         speakWithNaturalVoice("Please hold on while I fetch you the results.", async () => {
           try {
@@ -1686,6 +1691,7 @@
           }
           clearWatchdog();
           const rawTranscript = String(msg.transcript || "").trim();
+          if (rawTranscript) appendTranscript("You", rawTranscript);
           const transcript = rawTranscript.toLowerCase();
           // Echo guard: if the bot is currently speaking TTS OR finished
           // less than POST_TTS_GUARD_MS ago, drop this transcript — it is
@@ -2210,7 +2216,7 @@
             const maybeTicket = extractJsonObject(candidateText);
             if (realtimeAwaitingTicket && maybeTicket) {
               realtimeAwaitingTicket = false;
-              realtimeJsonEl.textContent = JSON.stringify(maybeTicket, null, 2);
+              // transcript panel shows conversation, not JSON
               submitStructuredTicket(maybeTicket)
                 .then(() => {
                   realtimeStatusEl.textContent =
@@ -2241,7 +2247,7 @@
               .trim();
             if (assistantText) {
               realtimeStatusEl.textContent = `Assistant: ${cleanedAssistantText}`;
-              realtimeJsonEl.textContent = cleanedAssistantText;
+              // transcript panel shows conversation, not raw assistant text
             } else {
               realtimeStatusEl.textContent = "Assistant responded with audio.";
             }
@@ -2257,7 +2263,7 @@
           if (realtimeAwaitingTicket) {
             realtimeStatusEl.textContent =
               "Realtime response was not valid JSON ticket payload. See raw debug below.";
-            realtimeJsonEl.textContent = candidateTexts.slice(0, 12).join("\n\n---\n\n");
+            // transcript panel shows conversation, not raw candidate text
             realtimeAwaitingTicket = false;
           }
         }
@@ -2315,6 +2321,7 @@
         }
 
         try {
+          clearTranscript();
           intentSubmitted = false;
           finalIntentRequested = false;
           realtimeAwaitingConversation = false;
