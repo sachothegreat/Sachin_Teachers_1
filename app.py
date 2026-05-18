@@ -323,10 +323,38 @@ def validate_query():
     query = _sanitize_text(str(payload.get("query", "")))
     business_unit = _sanitize_text(str(payload.get("business_unit", "")))
     history = payload.get("history", [])
+    # Optional strict mode — opt-in flag used by the typed Q3 flow only.
+    # When true, the validator applies a higher quality bar (requires both a
+    # concrete metric AND a scope dimension) and is more aggressive about
+    # rejecting bare entity references like "give me members".
+    strict = bool(payload.get("strict", False))
     if not isinstance(history, list):
         history = []
     if not query:
         return _error("query is required")
+
+    strict_rules_text = ""
+    if strict:
+        strict_rules_text = (
+            "\n\nSTRICT MODE — additional rules (typed Q3 flow):\n"
+            "- A bare entity reference like 'give me members', 'show me loans', "
+            "'I want deposits', 'pull accounts' is NOT enough. These name a "
+            "subject but specify no measurement and no scope. They MUST be "
+            "rejected unless the conversation history already supplies both a "
+            "measurement (count, total, average, growth, delinquency rate, "
+            "balance, volume, etc.) AND a scope (time range, segment, "
+            "branch, product line, comparison basis, etc.).\n"
+            "- Single-word or very short queries (under 5 words) without "
+            "supporting history context are almost always too vague — reject "
+            "them with a suggestion asking for what specifically they want to "
+            "measure or how they want it scoped.\n"
+            "- Do NOT auto-resolve a vague query by inventing a default "
+            "measurement or default time period. If the user did not say it "
+            "and history did not say it, ask — don't assume.\n"
+            "- When asking, request the SINGLE most important missing piece "
+            "(usually measurement OR scope, whichever is absent), not both at "
+            "once."
+        )
 
     # Build history context string for the prompt
     history_text = ""
@@ -357,28 +385,59 @@ def validate_query():
                             {
                                 "type": "input_text",
                                 "text": (
-                                    "You are validating data queries for Smartie, an enterprise data assistant "
+                                    "You are validating data queries for Syntheia, an enterprise data assistant "
                                     "at Teachers Federal Credit Union (TFCU), a large US credit union. "
                                     "IMPORTANT: Always assume all data queries are about Teachers Federal Credit Union "
                                     "unless explicitly stated otherwise. If the user says 'do it for TFCU' or "
                                     "'show me that' or any vague reference, use the conversation history to "
                                     "resolve what they mean and return a fully resolved query.\n\n"
+                                    "CONTEXT RULES — how to use conversation history:\n"
+                                    "- Treat the entire conversation history as cumulative context. Every "
+                                    "piece of information the user has provided in any prior turn (metric, "
+                                    "time period, time range, business unit, segment, filter, branch, product, "
+                                    "comparison, granularity, etc.) is STILL IN EFFECT for the current query "
+                                    "unless the user explicitly changes it.\n"
+                                    "- NEVER ask the user to clarify or provide something they have already "
+                                    "stated earlier in the conversation. If they said 'last quarter' three "
+                                    "turns ago, the time period is 'last quarter' — do not ask for time period "
+                                    "again. If you need a different dimension, ask only for that.\n"
+                                    "- When validating, mentally merge ALL user turns into one composite "
+                                    "query before deciding. The current message is just the latest delta.\n"
+                                    "- If the merged query has enough specificity to retrieve data, return "
+                                    "valid: true with a resolved_query that synthesizes every detail the user "
+                                    "has provided across the conversation (not just the latest message).\n\n"
+                                    "QUALITY BAR — do NOT lower it just because the conversation is long:\n"
+                                    "- A valid query needs AT MINIMUM: (a) a concrete metric or entity to "
+                                    "retrieve (e.g. loan volume, delinquency rate, member count, deposit "
+                                    "balance, branch performance), AND (b) enough scoping detail to make the "
+                                    "answer meaningful (time range, segment, comparison basis, or similar).\n"
+                                    "- If the merged query is still missing one of these essentials, mark "
+                                    "invalid even if there have been many turns. Number of turns does NOT "
+                                    "lower the quality bar.\n"
+                                    "- 'Show me data', 'give me numbers', 'how is X doing' — too vague even "
+                                    "after 5 turns if no concrete metric or scope ever surfaced.\n"
+                                    "- Conversely, 'loan volume for last quarter' is valid on the first turn — "
+                                    "concrete metric plus a time scope.\n\n"
                                     "Your job:\n"
-                                    "1. Check if the query (considering conversation history) is banking/credit union related\n"
+                                    "1. Check if the merged query (current + history) is banking/credit union related\n"
                                     "2. Check if it is specific enough to retrieve meaningful data\n"
                                     "3. If vague but resolvable from history, resolve it and mark as valid\n\n"
                                     "Respond ONLY with a valid JSON object, no prose, no markdown. Choose one:\n"
                                     '{"valid": true} — query is good as-is\n'
-                                    '{"valid": true, "resolved_query": "..."} — query was vague but resolved from history\n'
+                                    '{"valid": true, "resolved_query": "..."} — query was vague but resolved from history (preferred when history has details)\n'
                                     '{"valid": false, "suggestion": "..."} — query is invalid; suggestion coaches the user\n\n'
                                     "Suggestion rules:\n"
                                     "- 1-2 sentences, conversational and warm\n"
                                     "- Reference credit union concepts (loans, deposits, members, rates, delinquency, "
                                     "branches, transactions, accounts, etc.)\n"
                                     "- If previous coaching was given, build on it — don't repeat the same advice\n"
+                                    "- NEVER coach the user to provide info they already gave earlier in the "
+                                    "conversation history. Check history before suggesting.\n"
+                                    "- Ask for the ONE missing essential dimension, not a laundry list.\n"
                                     "- Do not invent table or column names\n"
                                     "- End with a period, not a question mark\n"
                                     "Never include markdown, code fences, or extra keys."
+                                    f"{strict_rules_text}"
                                     f"{history_text}"
                                 ),
                             }
@@ -549,7 +608,7 @@ def extract_answer():
 @app.post("/api/bridge-interrupt")
 def bridge_interrupt():
     """
-    Called when a user intentionally interrupts Smartie mid-speech.
+    Called when a user intentionally interrupts Syntheia mid-speech.
     Determines whether the interruption answers the current question,
     and returns a bridging response that connects what they said to
     the question being asked.
@@ -585,7 +644,7 @@ def bridge_interrupt():
             answers_context = "\nAnswers already captured: " + ", ".join(parts)
 
     system_prompt = (
-        "You are Smartie, a friendly and efficient voice intake assistant for "
+        "You are Syntheia, a friendly and efficient voice intake assistant for "
         "Teachers Federal Credit Union (TFCU). You were in the middle of asking "
         "the user a question when they interrupted you.\n\n"
         f"Question you were asking: {current_question}\n"
@@ -594,7 +653,7 @@ def bridge_interrupt():
         "Your job:\n"
         "1. Decide if the user's statement contains a usable answer to the current question.\n"
         "2. If YES: extract the answer cleanly and write a short bridge response that "
-        "confirms what you understood (1-2 sentences, warm, Smartie's voice).\n"
+        "confirms what you understood (1-2 sentences, warm, Syntheia's voice).\n"
         "3. If NO: write a short bridge response that acknowledges what they said and "
         "smoothly redirects back to the current question (1-2 sentences).\n\n"
         "Rules:\n"

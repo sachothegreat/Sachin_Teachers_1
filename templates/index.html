@@ -497,7 +497,7 @@
             />
           </div>
           <div class="page-header-text">
-            <h1>Hi, I'm <span>Smartie</span></h1>
+            <h1>Hi, I'm <span>Syntheia</span></h1>
             <p class="lede muted">
               I can help you explore our Enterprise Data for Insights.
             </p>
@@ -798,7 +798,7 @@
         return Promise.race([fetchCall, timeout]);
       }
 
-      async function validateBankingQuery(query, businessUnit = "", historyOverride = null) {
+      async function validateBankingQuery(query, businessUnit = "", historyOverride = null, strict = false) {
         const timeout = new Promise(resolve =>
           setTimeout(() => resolve({ valid: true }), 3000) // fail open after 3s
         );
@@ -814,6 +814,7 @@
                 query,
                 business_unit: businessUnit,
                 history: historyToSend,
+                strict: !!strict,
               }),
             });
             if (!response.ok) return { valid: true };
@@ -835,7 +836,7 @@
           if (!assistantAudioEl.paused) return;
           // Don't interrupt if TTS finished very recently (still processing)
           if (Date.now() - lastTtsStartMs < 3000) return;
-          realtimeStatusEl.textContent = "Smartie is ready — please go ahead.";
+          realtimeStatusEl.textContent = "Syntheia is ready — please go ahead.";
           askCurrentVoiceQuestion();
         }, delayMs);
       }
@@ -939,6 +940,16 @@
       let typedIntakeIndex = 0;
       let typedIntake2Answers = {};
       let typedIntake2Index = 0;
+      // Q3 conversation history for the typed flow so vague follow-ups
+      // ("do it for TFCU", "show me that") can be resolved from context
+      // and coaching suggestions build on previous turns instead of
+      // repeating the same advice.
+      let typedQ3History = [];
+      let typedQ3History2 = [];
+      let typedQ2FollowupPending = false;
+      let typedQ2FollowupCategory = null;
+      let typedQ2FollowupPending2 = false;
+      let typedQ2FollowupCategory2 = null;
 
       async function startDevices() {
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -1234,6 +1245,9 @@
         typed2StatusEl.textContent = "";
         typedIntakeAnswers = {};
         typedIntakeIndex = 0;
+        typedQ3History = [];
+        typedQ2FollowupPending = false;
+        typedQ2FollowupCategory = null;
         typedIntakePanel.style.display = "block";
         renderTypedQuestion();
       }
@@ -1259,6 +1273,9 @@
         typed2StatusEl.textContent = "";
         typedIntake2Answers = {};
         typedIntake2Index = 0;
+        typedQ3History2 = [];
+        typedQ2FollowupPending2 = false;
+        typedQ2FollowupCategory2 = null;
         typedIntakePanel2.style.display = "block";
         renderTypedQuestion2();
       }
@@ -1317,14 +1334,43 @@
           typedAnswer2El.focus();
           return;
         }
-        if (current.key === "details") {
-          typedQuestion2El.textContent = "Checking your query...";
-          const validation = await validateBankingQuery(answer, typedIntake2Answers.business_unit || "");
-          if (!validation.valid) {
-            typedQuestion2El.textContent = validation.suggestion || "That's a bit vague or off-topic. Please ask something specific and banking-related.";
+        if (current.key === "summary" && !typedQ2FollowupPending2) {
+          const category = detectQ2Category(answer);
+          if (category) {
+            typedIntake2Answers._q2Base = answer;
+            typedQ2FollowupPending2 = true;
+            typedQ2FollowupCategory2 = category;
+            typedQuestion2El.textContent = q2FollowupQuestion(category);
             typedAnswer2El.value = "";
             typedAnswer2El.focus();
             return;
+          }
+        }
+        if (current.key === "summary" && typedQ2FollowupPending2) {
+          typedQ2FollowupPending2 = false;
+          answer = `${typedIntake2Answers._q2Base}, specifically ${answer}`;
+          delete typedIntake2Answers._q2Base;
+        }
+        if (current.key === "details") {
+          typedQuestion2El.textContent = "Checking your query...";
+          typedQ3History2.push({ role: "user", content: answer });
+          const validation = await validateBankingQuery(
+            answer,
+            typedIntake2Answers.business_unit || "",
+            typedQ3History2,
+            true // strict mode for typed Q3
+          );
+          if (!validation.valid) {
+            const coaching = validation.suggestion || "That's a bit vague or off-topic. Please ask something specific and banking-related.";
+            typedQ3History2.push({ role: "assistant", content: coaching });
+            typedQuestion2El.textContent = coaching;
+            typedAnswer2El.value = "";
+            typedAnswer2El.focus();
+            return;
+          }
+          // If the validator resolved a vague query from context, use the resolved version.
+          if (validation.resolved_query) {
+            answer = validation.resolved_query;
           }
         }
         typedIntake2Answers[current.key] = answer;
@@ -1387,14 +1433,43 @@
           typedAnswerEl.focus();
           return;
         }
-        if (current.key === "details") {
-          typedQuestionEl.textContent = "Checking your query...";
-          const validation = await validateBankingQuery(answer, typedIntakeAnswers.business_unit || "");
-          if (!validation.valid) {
-            typedQuestionEl.textContent = validation.suggestion || "That's a bit vague or off-topic. Please ask something specific and banking-related.";
+        if (current.key === "summary" && !typedQ2FollowupPending) {
+          const category = detectQ2Category(answer);
+          if (category) {
+            typedIntakeAnswers._q2Base = answer;
+            typedQ2FollowupPending = true;
+            typedQ2FollowupCategory = category;
+            typedQuestionEl.textContent = q2FollowupQuestion(category);
             typedAnswerEl.value = "";
             typedAnswerEl.focus();
             return;
+          }
+        }
+        if (current.key === "summary" && typedQ2FollowupPending) {
+          typedQ2FollowupPending = false;
+          answer = `${typedIntakeAnswers._q2Base}, specifically ${answer}`;
+          delete typedIntakeAnswers._q2Base;
+        }
+        if (current.key === "details") {
+          typedQuestionEl.textContent = "Checking your query...";
+          typedQ3History.push({ role: "user", content: answer });
+          const validation = await validateBankingQuery(
+            answer,
+            typedIntakeAnswers.business_unit || "",
+            typedQ3History,
+            true // strict mode for typed Q3
+          );
+          if (!validation.valid) {
+            const coaching = validation.suggestion || "That's a bit vague or off-topic. Please ask something specific and banking-related.";
+            typedQ3History.push({ role: "assistant", content: coaching });
+            typedQuestionEl.textContent = coaching;
+            typedAnswerEl.value = "";
+            typedAnswerEl.focus();
+            return;
+          }
+          // If the validator resolved a vague query from context, use the resolved version.
+          if (validation.resolved_query) {
+            answer = validation.resolved_query;
           }
         }
         typedIntakeAnswers[current.key] = answer;
@@ -1833,7 +1908,7 @@
           if (pendingInterruptBridge) {
             pendingInterruptBridge = false;
             const bridgeStep = voiceIntakeStep;
-            realtimeStatusEl.textContent = "Smartie: picking up what you said...";
+            realtimeStatusEl.textContent = "Syntheia: picking up what you said...";
             const bridgeResult = await bridgeInterrupt(rawTranscript, bridgeStep, voiceIntakeAnswers);
             if (!realtimeIsActive) return;
             if (bridgeResult.resolved && bridgeResult.extracted_answer) {
@@ -1891,8 +1966,18 @@
           if (!key) {
             return;
           }
-          if (step === 1 && !isValidExplorationQuery(rawTranscript)) {
-            realtimeStatusEl.textContent = "Smartie: That's not on the menu.";
+          // Only run the "on the menu" validity check on the FIRST Q2 answer
+          // (the category). If q2FollowupCategory is already set, we are
+          // collecting the follow-up answer (e.g. "month over month") which
+          // is a sub-detail and must not be re-validated against the broad
+          // keyword list. Same goes for when q2FollowupPending is true.
+          if (
+            step === 1 &&
+            !q2FollowupPending &&
+            !q2FollowupCategory &&
+            !isValidExplorationQuery(rawTranscript)
+          ) {
+            realtimeStatusEl.textContent = "Syntheia: That's not on the menu.";
             speakWithNaturalVoice(
               "Come on fam, you and I both know that isn't on the menu. Try asking about metrics, reports, or trends!"
             );
@@ -2271,7 +2356,7 @@
 
           dataChannel.onopen = () => {
             realtimeStatusEl.textContent =
-              "Smartie is ready. Please answer 2 questions to get your insights.";
+              "Syntheia is ready. Please answer 2 questions to get your insights.";
             // GA schema: turn_detection and transcription live under audio.input.
             // (Beta path session.turn_detection / session.input_audio_transcription
             // is rejected silently and leaves the model with default VAD + no
@@ -2297,9 +2382,9 @@
               })
             );
             realtimeStatusEl.textContent =
-              "Connected — Smartie is listening.";
+              "Connected — Syntheia is listening.";
             speakWithNaturalVoice(
-              "Hi, Teachers Employee. I'm Smartie. I can help you explore our Enterprise Data for Insights. Before we get started, which business unit are you with?"
+              "Hi, Teachers Employee. I'm Syntheia. I can help you explore our Enterprise Data for Insights. Before we get started, which business unit are you with?"
             );
           };
 
