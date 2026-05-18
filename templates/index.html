@@ -667,6 +667,8 @@
       let voiceIntakeAnswers = {};
       let conversationHistory = []; // [{role:"assistant"|"user", content:"..."}]
       let q3History = [];          // Q3-specific attempt/coaching pairs (up to 10 entries)
+      let voiceQ3Attempts = 0;     // how many times the voice Q3 validator has rejected this run
+      const VOICE_Q3_MAX_ATTEMPTS = 3; // after this many rejections, fall open so the user is never stuck
       const voiceAcknowledgments = ["Got it.", "Thanks.", "Perfect.", "Nice.", "Okay."];
       function randomVoiceAck() {
         return voiceAcknowledgments[Math.floor(Math.random() * voiceAcknowledgments.length)];
@@ -706,6 +708,26 @@
         if (letters === 0) return false;
         if (nonAscii > 0 && letters < 4) return false;
         return true;
+      }
+      function buildVoiceQ3ValidationHistory() {
+        // Prepend Q1 + Q2 answers to the Q3 history so the validator sees the
+        // full picture (business unit + the kind of data wanted), not just
+        // raw Q3 attempts. Without this, strict mode rejects answers it
+        // would otherwise accept once the missing context is supplied.
+        const contextTurns = [];
+        if (voiceIntakeAnswers.business_unit) {
+          contextTurns.push({
+            role: "user",
+            content: `Business unit: ${voiceIntakeAnswers.business_unit}`,
+          });
+        }
+        if (voiceIntakeAnswers.summary) {
+          contextTurns.push({
+            role: "user",
+            content: `Kind of data wanted: ${voiceIntakeAnswers.summary}`,
+          });
+        }
+        return contextTurns.concat(q3History);
       }
       async function acceptQ2Answer(text) {
         const original = String(text || "").trim();
@@ -1832,7 +1854,10 @@
           if (pendingVoiceConfirmation) {
             if (isYesConfirmation(transcript)) {
               const { key, value, step, validation } = pendingVoiceConfirmation;
-              // Q3: check if background validation is done and failed
+              // Q3: check if background validation is done and failed.
+              // Strict bar applies for the first VOICE_Q3_MAX_ATTEMPTS tries;
+              // after that the validator was already called non-strict, so we
+              // accept whatever came back to avoid trapping the user.
               if (step === 2) {
                 if (validation === null) {
                   // Still validating — hold briefly and let user know
@@ -1840,7 +1865,8 @@
                   speakWithNaturalVoice("Just one moment while I check that for you.");
                   return;
                 }
-                if (!validation.valid) {
+                if (!validation.valid && voiceQ3Attempts < VOICE_Q3_MAX_ATTEMPTS) {
+                  voiceQ3Attempts += 1;
                   pendingVoiceConfirmation = null;
                   const coaching = validation.suggestion || "Try something more specific and banking-related.";
                   q3History.push({ role: "assistant", content: coaching });
@@ -1850,9 +1876,10 @@
               }
               voiceIntakeAnswers[key] = value;
               pendingVoiceConfirmation = null;
-              // Q3 confirmed — clear the Q3-specific history
+              // Q3 confirmed — clear the Q3-specific history and reset attempts
               if (step === 2) {
                 q3History = [];
+                voiceQ3Attempts = 0;
               }
               voiceIntakeStep = step + 1;
               if (voiceIntakeStep >= voiceIntakeQuestions.length) {
@@ -1894,6 +1921,7 @@
             voiceIntakeStep = 0;
             voiceIntakeAnswers = {};
             q3History = [];
+            voiceQ3Attempts = 0;
             pendingInterruptBridge = false;
             startQuestioningPhase();
             pendingVoiceConfirmation = null;
@@ -1964,7 +1992,9 @@
                 : `Got it — I heard "${shortEcho(extracted)}". Is that correct? Please say yes or no.`;
               if (bridgeStep === 2) {
                 q3History.push({ role: "user", content: rawTranscript });
-                validateBankingQuery(extracted, voiceIntakeAnswers.business_unit || "", q3History).then(result => {
+                const voiceQ3HistoryBridge = buildVoiceQ3ValidationHistory();
+                const useStrictBridge = voiceQ3Attempts < VOICE_Q3_MAX_ATTEMPTS;
+                validateBankingQuery(extracted, voiceIntakeAnswers.business_unit || "", voiceQ3HistoryBridge, useStrictBridge).then(result => {
                   if (pendingVoiceConfirmation && pendingVoiceConfirmation.value === extracted) {
                     if (result.resolved_query) pendingVoiceConfirmation.value = result.resolved_query;
                     pendingVoiceConfirmation.validation = result;
@@ -2042,9 +2072,15 @@
               }
             });
           }
-          // Background: Q3 validation
+          // Background: Q3 validation (strict — voice Q3 must meet the same
+          // quality bar as typed Q3: concrete metric + scope, with Q1/Q2 as
+          // context so the validator knows the business unit and the kind of
+          // data the user already named). An attempt counter (below) prevents
+          // an infinite reject loop.
           if (step === 2) {
-            validateBankingQuery(rawTranscript, voiceIntakeAnswers.business_unit || "", q3History).then(result => {
+            const voiceQ3History = buildVoiceQ3ValidationHistory();
+            const useStrict = voiceQ3Attempts < VOICE_Q3_MAX_ATTEMPTS;
+            validateBankingQuery(rawTranscript, voiceIntakeAnswers.business_unit || "", voiceQ3History, useStrict).then(result => {
               if (pendingVoiceConfirmation) {
                 if (result.resolved_query) {
                   // Only use resolved_query if it adds specificity (≥ original word count).
@@ -2321,6 +2357,7 @@
           voiceIntakeAnswers = {};
           conversationHistory = [];
           q3History = [];
+          voiceQ3Attempts = 0;
           pendingInterruptBridge = false;
           startQuestioningPhase();
           pendingVoiceConfirmation = null;
