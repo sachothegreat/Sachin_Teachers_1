@@ -533,6 +533,109 @@ def translate_text():
     return jsonify({"translated": translated or "", "ok": bool(translated)})
 
 
+Q2_INTAKE_QUESTION = (
+    "Please specify what kind of data you want — metrics, trends, or reports — "
+    "and whether you are looking for anything specific, such as year over year, "
+    "month over month, by branch, or similar."
+)
+
+
+@app.post("/api/q2-accept-answer")
+def q2_accept_answer():
+    """
+    Uses AI discretion to decide whether the user's Q2 answer is acceptable.
+    Accepts metrics / trends / reports (or close equivalents like KPIs,
+    analytics, insights), including combined answers like
+    "trends year over year" or "loan metrics by branch", without forcing a
+    follow-up question. Fails open on any error.
+    """
+    import json as _json
+
+    payload = request.get_json(silent=True) or {}
+    text = _sanitize_text(str(payload.get("text", "")))
+    if not text:
+        return _error("text is required")
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return jsonify({"acceptable": True, "normalized_answer": text})
+
+    model = os.getenv("OPENAI_TEXT_MODEL", "gpt-4.1-mini")
+    try:
+        response = _post_openai(
+            url="https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            body={
+                "model": model,
+                "input": [
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    f"The user was asked: \"{Q2_INTAKE_QUESTION}\"\n\n"
+                                    "Decide if their reply is an acceptable answer for a "
+                                    "credit-union data assistant.\n\n"
+                                    "Accept when they clearly want metrics, trends, or reports "
+                                    "(or close equivalents like KPIs, analytics, insights, or "
+                                    "data exploration) — including when they combine category "
+                                    "and specifics in one phrase, e.g. 'trends year over year', "
+                                    "'loan volume metrics by branch', 'monthly deposit report'.\n\n"
+                                    "Use discretion: do not require both category and time "
+                                    "granularity if the answer is already useful. Reject only "
+                                    "when off-topic, empty of intent, or too vague to act on "
+                                    "(e.g. 'hello', 'stuff', 'I don't know' with no data angle).\n\n"
+                                    "Respond ONLY with JSON:\n"
+                                    '{"acceptable": true, "normalized_answer": "short clean summary of what they want"}\n'
+                                    "or\n"
+                                    '{"acceptable": false, "coaching": "1-2 warm sentences asking them to name metrics, trends, or reports and any specific focus like YoY or MoM if helpful"}'
+                                ),
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                ],
+                "max_output_tokens": 150,
+            },
+            timeout=6,
+        )
+    except requests.RequestException:
+        return jsonify({"acceptable": True, "normalized_answer": text})
+
+    if not response.ok:
+        return jsonify({"acceptable": True, "normalized_answer": text})
+
+    data = response.json()
+    raw = _extract_response_text(data) or ""
+    raw = raw.strip()
+    # LLM sometimes wraps JSON in markdown fences — strip them.
+    if raw.startswith("```"):
+        raw = raw.strip("`").lstrip("json").strip()
+    try:
+        result = _json.loads(raw)
+    except Exception:
+        return jsonify({"acceptable": True, "normalized_answer": text})
+
+    acceptable = bool(result.get("acceptable", False))
+    if acceptable:
+        normalized = _sanitize_text(str(result.get("normalized_answer", ""))) or text
+        return jsonify({"acceptable": True, "normalized_answer": normalized})
+    coaching = _sanitize_text(str(result.get("coaching", "")))
+    if not coaching:
+        coaching = (
+            "Please mention metrics, trends, or reports, and any specific "
+            "focus like year over year or month over month if you have one."
+        )
+    return jsonify({"acceptable": False, "coaching": coaching})
+
+
 @app.post("/api/extract-answer")
 def extract_answer():
     """
@@ -553,7 +656,7 @@ def extract_answer():
 
     question_map = {
         0: "Which business unit are you with?",
-        1: "What type of data are you looking for — metrics, trends, or reports?",
+        1: Q2_INTAKE_QUESTION,
         2: "What specific query would you like relayed to the data system?",
     }
     current_question = question_map.get(step, "What are you looking for?")
@@ -629,7 +732,7 @@ def bridge_interrupt():
 
     question_map = {
         0: "Which business unit are you with?",
-        1: "What type of data are you looking for — metrics, trends, or reports?",
+        1: Q2_INTAKE_QUESTION,
         2: "What specific query would you like relayed to the data system?",
     }
     current_question = question_map.get(step, "What are you looking for?")

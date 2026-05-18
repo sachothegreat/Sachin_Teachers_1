@@ -654,9 +654,12 @@
       const FACE_CHECK_INTERVAL_MS = 1200;
       const MULTI_FACE_CONFIRMATION_THRESHOLD = 2;
       const intentReadyMarker = "INTENT_READY";
+      const Q2_INTAKE_PROMPT =
+        "Please specify what kind of data you want: metrics, trends, or reports. " +
+        "If you have a specific focus, like year over year, month over month, or by branch, include that too.";
       const voiceIntakeQuestions = [
         "Which business unit are you with?",
-        "What would you like to explore today?",
+        Q2_INTAKE_PROMPT,
         "What query would you like relayed?",
       ];
       const voiceIntakeKeys = ["business_unit", "summary", "details"];
@@ -664,8 +667,6 @@
       let voiceIntakeAnswers = {};
       let conversationHistory = []; // [{role:"assistant"|"user", content:"..."}]
       let q3History = [];          // Q3-specific attempt/coaching pairs (up to 10 entries)
-      let q2FollowupPending = false; // true when Q2 category detected and we need a follow-up clarification
-      let q2FollowupCategory = null;  // stores the detected category so we can re-ask on "no"
       const voiceAcknowledgments = ["Got it.", "Thanks.", "Perfect.", "Nice.", "Okay."];
       function randomVoiceAck() {
         return voiceAcknowledgments[Math.floor(Math.random() * voiceAcknowledgments.length)];
@@ -706,21 +707,27 @@
         if (nonAscii > 0 && letters < 4) return false;
         return true;
       }
-      function detectQ2Category(text) {
-        // Detects metric/trend/report anywhere in the answer
-        const t = String(text || "").toLowerCase();
-        if (/\bmetrics?\b/.test(t) || /\bkpis?\b/.test(t)) return "metric";
-        if (/\btrends?\b/.test(t)) return "trend";
-        if (/\breports?\b/.test(t)) return "report";
-        if (/\bdata\b|\banalytics\b|\binsights?\b/.test(t)) return "data";
-        return null;
-      }
-      function q2FollowupQuestion(category) {
-        if (category === "metric") return "What specific metrics are you looking for? For example, loan volume, member counts, or deposit balances?";
-        if (category === "trend") return "What kind of trends? For example, growth over time, or month over month changes?";
-        if (category === "report") return "What type of report — a summary, branch breakdown, or performance overview?";
-        if (category === "data") return "What specific data are you after? Like loan figures, member stats, or something else?";
-        return "Can you be a bit more specific about what you are looking for?";
+      async function acceptQ2Answer(text) {
+        const original = String(text || "").trim();
+        const timeout = new Promise(resolve =>
+          setTimeout(() => resolve({ acceptable: true, normalized_answer: original }), 3000)
+        );
+        const fetchCall = (async () => {
+          try {
+            const response = await fetch("/api/q2-accept-answer", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ text: original }),
+            });
+            if (!response.ok) {
+              return { acceptable: true, normalized_answer: original };
+            }
+            return await response.json();
+          } catch (_) {
+            return { acceptable: true, normalized_answer: original };
+          }
+        })();
+        return Promise.race([fetchCall, timeout]);
       }
       function getStepLabel(step) {
         return `${Math.min(step + 1, voiceIntakeQuestions.length)}/${voiceIntakeQuestions.length}`;
@@ -937,7 +944,7 @@
       }
       const typedIntakeQuestions = [
         { key: "business_unit", prompt: "Which business unit are you with?" },
-        { key: "summary", prompt: "What would you like to explore today? You can ask about any metrics, trends, or reports." },
+        { key: "summary", prompt: Q2_INTAKE_PROMPT },
         { key: "details", prompt: "What query would you like relayed? Please be specific and banking-related." },
       ];
       let typedIntakeAnswers = {};
@@ -950,10 +957,9 @@
       // repeating the same advice.
       let typedQ3History = [];
       let typedQ3History2 = [];
-      let typedQ2FollowupPending = false;
-      let typedQ2FollowupCategory = null;
-      let typedQ2FollowupPending2 = false;
-      let typedQ2FollowupCategory2 = null;
+      let typedQ3Attempts = 0;
+      let typedQ3Attempts2 = 0;
+      const TYPED_Q3_MAX_ATTEMPTS = 3;
 
       async function startDevices() {
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -1250,8 +1256,7 @@
         typedIntakeAnswers = {};
         typedIntakeIndex = 0;
         typedQ3History = [];
-        typedQ2FollowupPending = false;
-        typedQ2FollowupCategory = null;
+        typedQ3Attempts = 0;
         typedIntakePanel.style.display = "block";
         renderTypedQuestion();
       }
@@ -1278,8 +1283,7 @@
         typedIntake2Answers = {};
         typedIntake2Index = 0;
         typedQ3History2 = [];
-        typedQ2FollowupPending2 = false;
-        typedQ2FollowupCategory2 = null;
+        typedQ3Attempts2 = 0;
         typedIntakePanel2.style.display = "block";
         renderTypedQuestion2();
       }
@@ -1331,40 +1335,51 @@
             typedAnswer2El.value = translated;
           }
         }
-        if (current.key === "summary" && !isValidExplorationQuery(answer)) {
-          typedQuestion2El.textContent =
-            "Come on fam, you and I both know that isn't on the menu. Try asking about metrics, reports, or trends!";
-          typedAnswer2El.value = "";
-          typedAnswer2El.focus();
-          return;
-        }
-        if (current.key === "summary" && !typedQ2FollowupPending2) {
-          const category = detectQ2Category(answer);
-          if (category) {
-            typedIntake2Answers._q2Base = answer;
-            typedQ2FollowupPending2 = true;
-            typedQ2FollowupCategory2 = category;
-            typedQuestion2El.textContent = q2FollowupQuestion(category);
+        if (current.key === "summary") {
+          typedQuestion2El.textContent = "Checking your answer...";
+          const q2Check = await acceptQ2Answer(answer);
+          if (!q2Check.acceptable) {
+            typedQuestion2El.textContent =
+              q2Check.coaching ||
+              "Please specify metrics, trends, or reports, and any specific focus like year over year or month over month if you have one.";
             typedAnswer2El.value = "";
             typedAnswer2El.focus();
             return;
           }
-        }
-        if (current.key === "summary" && typedQ2FollowupPending2) {
-          typedQ2FollowupPending2 = false;
-          answer = `${typedIntake2Answers._q2Base}, specifically ${answer}`;
-          delete typedIntake2Answers._q2Base;
+          answer = q2Check.normalized_answer || answer;
         }
         if (current.key === "details") {
           typedQuestion2El.textContent = "Checking your query...";
+          typedQ3Attempts2 += 1;
           typedQ3History2.push({ role: "user", content: answer });
+          // Prepend Q1 + Q2 context so the validator sees the full picture
+          // (business unit and the kind of data they want), not just Q3
+          // attempts. Without this, strict mode rejects reasonable answers
+          // and the user gets the same coaching on every attempt.
+          const contextTurns2 = [];
+          if (typedIntake2Answers.business_unit) {
+            contextTurns2.push({
+              role: "user",
+              content: `Business unit: ${typedIntake2Answers.business_unit}`,
+            });
+          }
+          if (typedIntake2Answers.summary) {
+            contextTurns2.push({
+              role: "user",
+              content: `Kind of data wanted: ${typedIntake2Answers.summary}`,
+            });
+          }
+          const historyForValidation2 = contextTurns2.concat(typedQ3History2);
+          // After several rejected attempts, fall open so the user can never
+          // get stuck in a loop hearing the same coaching back.
+          const useStrict2 = typedQ3Attempts2 < TYPED_Q3_MAX_ATTEMPTS;
           const validation = await validateBankingQuery(
             answer,
             typedIntake2Answers.business_unit || "",
-            typedQ3History2,
-            true // strict mode for typed Q3
+            historyForValidation2,
+            useStrict2
           );
-          if (!validation.valid) {
+          if (!validation.valid && typedQ3Attempts2 < TYPED_Q3_MAX_ATTEMPTS) {
             const coaching = validation.suggestion || "That's a bit vague or off-topic. Please ask something specific and banking-related.";
             typedQ3History2.push({ role: "assistant", content: coaching });
             typedQuestion2El.textContent = coaching;
@@ -1372,10 +1387,10 @@
             typedAnswer2El.focus();
             return;
           }
-          // If the validator resolved a vague query from context, use the resolved version.
           if (validation.resolved_query) {
             answer = validation.resolved_query;
           }
+          typedQ3Attempts2 = 0;
         }
         typedIntake2Answers[current.key] = answer;
         typedIntake2Index += 1;
@@ -1430,40 +1445,51 @@
             typedAnswerEl.value = translated;
           }
         }
-        if (current.key === "summary" && !isValidExplorationQuery(answer)) {
-          typedQuestionEl.textContent =
-            "Come on fam, you and I both know that isn't on the menu. Try asking about metrics, reports, or trends!";
-          typedAnswerEl.value = "";
-          typedAnswerEl.focus();
-          return;
-        }
-        if (current.key === "summary" && !typedQ2FollowupPending) {
-          const category = detectQ2Category(answer);
-          if (category) {
-            typedIntakeAnswers._q2Base = answer;
-            typedQ2FollowupPending = true;
-            typedQ2FollowupCategory = category;
-            typedQuestionEl.textContent = q2FollowupQuestion(category);
+        if (current.key === "summary") {
+          typedQuestionEl.textContent = "Checking your answer...";
+          const q2Check = await acceptQ2Answer(answer);
+          if (!q2Check.acceptable) {
+            typedQuestionEl.textContent =
+              q2Check.coaching ||
+              "Please specify metrics, trends, or reports, and any specific focus like year over year or month over month if you have one.";
             typedAnswerEl.value = "";
             typedAnswerEl.focus();
             return;
           }
-        }
-        if (current.key === "summary" && typedQ2FollowupPending) {
-          typedQ2FollowupPending = false;
-          answer = `${typedIntakeAnswers._q2Base}, specifically ${answer}`;
-          delete typedIntakeAnswers._q2Base;
+          answer = q2Check.normalized_answer || answer;
         }
         if (current.key === "details") {
           typedQuestionEl.textContent = "Checking your query...";
+          typedQ3Attempts += 1;
           typedQ3History.push({ role: "user", content: answer });
+          // Prepend Q1 + Q2 context so the validator sees the full picture
+          // (business unit and the kind of data they want), not just Q3
+          // attempts. Without this, strict mode rejects reasonable answers
+          // and the user gets the same coaching on every attempt.
+          const contextTurns = [];
+          if (typedIntakeAnswers.business_unit) {
+            contextTurns.push({
+              role: "user",
+              content: `Business unit: ${typedIntakeAnswers.business_unit}`,
+            });
+          }
+          if (typedIntakeAnswers.summary) {
+            contextTurns.push({
+              role: "user",
+              content: `Kind of data wanted: ${typedIntakeAnswers.summary}`,
+            });
+          }
+          const historyForValidation = contextTurns.concat(typedQ3History);
+          // After several rejected attempts, fall open so the user can never
+          // get stuck in a loop hearing the same coaching back.
+          const useStrict = typedQ3Attempts < TYPED_Q3_MAX_ATTEMPTS;
           const validation = await validateBankingQuery(
             answer,
             typedIntakeAnswers.business_unit || "",
-            typedQ3History,
-            true // strict mode for typed Q3
+            historyForValidation,
+            useStrict
           );
-          if (!validation.valid) {
+          if (!validation.valid && typedQ3Attempts < TYPED_Q3_MAX_ATTEMPTS) {
             const coaching = validation.suggestion || "That's a bit vague or off-topic. Please ask something specific and banking-related.";
             typedQ3History.push({ role: "assistant", content: coaching });
             typedQuestionEl.textContent = coaching;
@@ -1471,10 +1497,10 @@
             typedAnswerEl.focus();
             return;
           }
-          // If the validator resolved a vague query from context, use the resolved version.
           if (validation.resolved_query) {
             answer = validation.resolved_query;
           }
+          typedQ3Attempts = 0;
         }
         typedIntakeAnswers[current.key] = answer;
         typedIntakeIndex += 1;
@@ -1805,7 +1831,7 @@
           }
           if (pendingVoiceConfirmation) {
             if (isYesConfirmation(transcript)) {
-              const { key, value, step, validation, isFollowup } = pendingVoiceConfirmation;
+              const { key, value, step, validation } = pendingVoiceConfirmation;
               // Q3: check if background validation is done and failed
               if (step === 2) {
                 if (validation === null) {
@@ -1822,32 +1848,11 @@
                   return;
                 }
               }
-              // Grab rawInput before clearing pendingVoiceConfirmation
-              const rawInput = pendingVoiceConfirmation ? pendingVoiceConfirmation.rawInput : null;
               voiceIntakeAnswers[key] = value;
               pendingVoiceConfirmation = null;
               // Q3 confirmed — clear the Q3-specific history
               if (step === 2) {
                 q3History = [];
-              }
-              // Q2 confirmed — handle follow-up confirmation or initial category detection
-              if (step === 1) {
-                if (isFollowup) {
-                  // Follow-up answer confirmed — advance to Q3
-                  q2FollowupCategory = null;
-                  voiceIntakeStep = 2;
-                  realtimeStatusEl.textContent = `Captured (Q2): ${shortEcho(value)}`;
-                  askCurrentVoiceQuestion("Perfect. And lastly,");
-                  return;
-                }
-                const category = detectQ2Category(rawInput || value);
-                if (category) {
-                  q2FollowupCategory = category;
-                  q2FollowupPending = true;
-                  realtimeStatusEl.textContent = "Asking follow-up on Q2...";
-                  speakWithNaturalVoice(q2FollowupQuestion(category));
-                  return;
-                }
               }
               voiceIntakeStep = step + 1;
               if (voiceIntakeStep >= voiceIntakeQuestions.length) {
@@ -1858,7 +1863,7 @@
                 finalizeVoiceIntake();
               } else {
                 const ack = voiceIntakeStep === 1
-                  ? "Got it. You can ask me about any metrics, trends, or reports."
+                  ? "Got it."
                   : voiceIntakeStep === 2
                   ? "Perfect. And lastly,"
                   : "Perfect, confirmed.";
@@ -1867,15 +1872,8 @@
               return;
             }
             if (isNoConfirmation(transcript)) {
-              const { step, isFollowup } = pendingVoiceConfirmation;
+              const { step } = pendingVoiceConfirmation;
               pendingVoiceConfirmation = null;
-              if (step === 1 && isFollowup) {
-                // Re-ask the follow-up question, not the whole Q2
-                q2FollowupPending = true;
-                realtimeStatusEl.textContent = "Re-asking follow-up...";
-                speakWithNaturalVoice(q2FollowupQuestion(q2FollowupCategory || "report"));
-                return;
-              }
               // Q3: remove the rejected attempt from history so validation context stays clean
               if (step === 2 && q3History.length > 0) {
                 q3History.pop();
@@ -1896,8 +1894,6 @@
             voiceIntakeStep = 0;
             voiceIntakeAnswers = {};
             q3History = [];
-            q2FollowupPending = false;
-            q2FollowupCategory = null;
             pendingInterruptBridge = false;
             startQuestioningPhase();
             pendingVoiceConfirmation = null;
@@ -1936,9 +1932,33 @@
               // LLM extracted a usable answer — pre-fill and ask user to confirm
               const extracted = bridgeResult.extracted_answer;
               const key = voiceIntakeKeys[bridgeStep];
+              if (bridgeStep === 1) {
+                // If bridge resolution happened while handling Q2, treat the
+                // extracted answer as captured and move directly to Q3 input.
+                // Do not insert an extra yes/no confirmation gate here.
+                voiceIntakeAnswers[key] = extracted;
+                pendingVoiceConfirmation = null;
+                voiceIntakeStep = 2;
+                const bridgeText = String(bridgeResult.bridge_response || "").trim();
+                const alreadyAsksQ3 =
+                  /\?$/.test(bridgeText) ||
+                  /what specific query/i.test(bridgeText) ||
+                  /what query/i.test(bridgeText);
+                realtimeStatusEl.textContent = `Captured (Q2): ${shortEcho(extracted)} — moving to Q3`;
+                if (bridgeText) {
+                  if (alreadyAsksQ3) {
+                    speakWithNaturalVoice(bridgeText);
+                  } else {
+                    askCurrentVoiceQuestion(bridgeText.replace(/[.!?]+$/, "") + ". And lastly,");
+                  }
+                } else {
+                  askCurrentVoiceQuestion("Got it. And lastly,");
+                }
+                return;
+              }
               pendingVoiceConfirmation = { key, value: extracted, step: bridgeStep, validation: null };
               realtimeStatusEl.textContent = `Confirming (${getStepLabel(bridgeStep)}): ${shortEcho(extracted)}`;
-              // Always explicitly ask for yes/no — never rely on LLM to include it
+              // For non-Q2 bridge resolutions, keep explicit yes/no confirmation.
               const ack = bridgeResult.bridge_response
                 ? `${bridgeResult.bridge_response.replace(/[.!?]+$/, "")}. Is that correct? Please say yes or no.`
                 : `Got it — I heard "${shortEcho(extracted)}". Is that correct? Please say yes or no.`;
@@ -1961,65 +1981,29 @@
             return;
           }
 
-          // If we asked a Q2 follow-up, confirm the answer with yes/no before
-          // advancing. The existing pendingVoiceConfirmation yes-branch with
-          // isFollowup: true will move us on to Q3 once the user confirms.
-          if (q2FollowupPending) {
-            q2FollowupPending = false;
-            const combined = `${voiceIntakeAnswers.summary}, specifically ${rawTranscript}`;
-            conversationHistory.push({ role: "user", content: rawTranscript });
-            pendingVoiceConfirmation = {
-              key: "summary",
-              value: combined,
-              step: 1,
-              isFollowup: true,
-              rawInput: rawTranscript,
-              validation: null,
-            };
-            realtimeStatusEl.textContent = `Confirming follow-up: ${shortEcho(rawTranscript)}`;
-            speakWithNaturalVoice(
-              `I heard "${ttsEcho(rawTranscript)}". Is that correct? Please say yes or no.`
-            );
-            return;
-          }
           const step = voiceIntakeStep;
           const key = voiceIntakeKeys[step];
           if (!key) {
             return;
           }
-          // Only run the "on the menu" validity check on the FIRST Q2 answer
-          // (the category). If q2FollowupCategory is already set, we are
-          // collecting the follow-up answer (e.g. "month over month") which
-          // is a sub-detail and must not be re-validated against the broad
-          // keyword list. Same goes for when q2FollowupPending is true.
-          if (
-            step === 1 &&
-            !q2FollowupPending &&
-            !q2FollowupCategory &&
-            !isValidExplorationQuery(rawTranscript)
-          ) {
-            realtimeStatusEl.textContent = "Syntheia: That's not on the menu.";
-            speakWithNaturalVoice(
-              "Come on fam, you and I both know that isn't on the menu. Try asking about metrics, reports, or trends!"
-            );
-            return;
-          }
-          // Q2 category fast-path: when the first answer is a clear category
-          // (e.g. "reports", "metrics", "trends"), skip the yes/no confirmation
-          // and go straight into acknowledgment + follow-up question in one breath.
-          // The follow-up answer itself still goes through normal confirmation.
+          // Q2: ask the LLM whether the answer is acceptable. AI uses
+          // discretion — accepts metrics/trends/reports answers, including
+          // combined ones like "trends year over year" or "loan metrics by
+          // branch", without forcing a separate follow-up question.
+          let q2AnswerForConfirm = rawTranscript;
           if (step === 1) {
-            const category = detectQ2Category(rawTranscript);
-            if (category) {
-              conversationHistory.push({ role: "user", content: rawTranscript });
-              voiceIntakeAnswers[key] = rawTranscript;
-              q2FollowupCategory = category;
-              q2FollowupPending = true;
-              const ackWord = shortEcho(rawTranscript);
-              realtimeStatusEl.textContent = `Captured (Q2): ${ackWord} — asking follow-up...`;
-              speakWithNaturalVoice(`Got it, ${ttsEcho(rawTranscript)}. ${q2FollowupQuestion(category)}`);
+            realtimeStatusEl.textContent = "Checking your answer...";
+            const q2Check = await acceptQ2Answer(rawTranscript);
+            if (!realtimeIsActive) return;
+            if (!q2Check.acceptable) {
+              const coaching =
+                q2Check.coaching ||
+                "Please specify metrics, trends, or reports, and any specific focus like year over year or month over month if you have one.";
+              realtimeStatusEl.textContent = "Syntheia: need a bit more detail on Q2.";
+              speakWithNaturalVoice(`${coaching} ${Q2_INTAKE_PROMPT}`);
               return;
             }
+            q2AnswerForConfirm = q2Check.normalized_answer || rawTranscript;
           }
           // Respond immediately — set confirmation with raw transcript right away
           // AI extraction runs in background and updates the value before user says yes
@@ -2029,9 +2013,15 @@
             conversationHistory.push({ role: "user", content: rawTranscript });
           }
           // rawTranscript stored as rawInput so vagueness checks always use original speech
-          pendingVoiceConfirmation = { key, value: rawTranscript, step, validation: null, rawInput: rawTranscript };
-          const echo = shortEcho(rawTranscript);
-          const spokenEcho = ttsEcho(rawTranscript);
+          pendingVoiceConfirmation = {
+            key,
+            value: q2AnswerForConfirm,
+            step,
+            validation: null,
+            rawInput: rawTranscript,
+          };
+          const echo = shortEcho(q2AnswerForConfirm);
+          const spokenEcho = ttsEcho(q2AnswerForConfirm);
           realtimeStatusEl.textContent = `Confirming (${getStepLabel(step)}): ${echo}`;
           speakWithNaturalVoice(`I heard "${spokenEcho}". Is that correct? Please say yes or no.`);
           // Background: AI extraction only for Q3 — Q1/Q2 answers are short and don't need it,
@@ -2155,7 +2145,7 @@
           }
           // If the interruption was long enough to be intentional and not a confirmation reply,
           // flag the next transcript for bridge processing
-          if (ttsInterruptedByUser && speechDuration >= 800 && !pendingVoiceConfirmation && !q2FollowupPending) {
+          if (ttsInterruptedByUser && speechDuration >= 800 && !pendingVoiceConfirmation) {
             pendingInterruptBridge = true;
           }
           ttsInterruptedByUser = false;
@@ -2331,8 +2321,6 @@
           voiceIntakeAnswers = {};
           conversationHistory = [];
           q3History = [];
-          q2FollowupPending = false;
-          q2FollowupCategory = null;
           pendingInterruptBridge = false;
           startQuestioningPhase();
           pendingVoiceConfirmation = null;
