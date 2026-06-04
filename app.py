@@ -178,6 +178,207 @@ def _forward_to_cortex(ticket: dict) -> dict:
     }
 
 
+def _collect_agent_text(content) -> str:
+    """
+    Pull the user-facing answer text out of a Cortex assistant message
+    `content` array. The agent returns a list of typed parts (thinking,
+    tool_use, tool_result, text); only `type == "text"` parts hold the answer.
+    """
+    out = ""
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                out += part.get("text", "")
+    elif isinstance(content, str):
+        out += content
+    return out
+
+
+def _extract_sql_and_data(content):
+    """
+    Walk an assistant message `content` array and pull the semantic-layer
+    output produced by the Cortex Analyst tool: the generated SQL, the column
+    names, and the result rows. Returns (sql, columns, rows).
+
+    The relevant shape is:
+      {"type": "tool_result",
+       "tool_result": {"content": [{"type": "json", "json": {
+           "sql": "...",
+           "result_set": {"data": [[...]], "resultSetMetaData": {"rowType": [...]}}
+       }}]}}
+    """
+    sql = ""
+    columns = []
+    rows = []
+    if not isinstance(content, list):
+        return sql, columns, rows
+
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "tool_result":
+            continue
+        tr = part.get("tool_result")
+        if not isinstance(tr, dict):
+            continue
+        for item in tr.get("content", []) or []:
+            if not isinstance(item, dict):
+                continue
+            j = item.get("json")
+            if not isinstance(j, dict):
+                continue
+            if j.get("sql") and not sql:
+                sql = j["sql"]
+            result_set = j.get("result_set")
+            if isinstance(result_set, dict):
+                data = result_set.get("data")
+                if isinstance(data, list) and data and not rows:
+                    rows = data
+                meta = result_set.get("resultSetMetaData") or {}
+                row_type = meta.get("rowType")
+                if isinstance(row_type, list) and not columns:
+                    columns = [
+                        c.get("name", "") for c in row_type if isinstance(c, dict)
+                    ]
+    return sql, columns, rows
+
+
+def _call_cortex_agent(question: str, history=None) -> dict:
+    """
+    Sends a natural language question to a Snowflake Cortex Agent *object* via
+    the agent:run REST API and returns the natural-language answer plus the
+    semantic-layer SQL and result rows behind it.
+
+    `history` is an optional list of prior turns [{"role": "user"|"assistant",
+    "text": "..."}] which is prepended to the request so the agent can refine
+    its answer across a multi-turn conversation.
+
+    Returns {"answer", "sql", "columns", "rows"} on success or {"error"} on
+    failure. Docs:
+    https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-agents-run
+    """
+    import json as _json
+
+    account = os.getenv("SNOWFLAKE_ACCOUNT", "cqc13247.us-east-1")
+    host = f"{account}.snowflakecomputing.com"
+
+    pat = os.getenv("SNOWFLAKE_PAT", "")
+    if not pat or pat == "paste_your_pat_token_here":
+        return {"error": "SNOWFLAKE_PAT is not configured in .env"}
+
+    # The agent is a database object addressed as DB.SCHEMA.NAME and is
+    # referenced in the URL path, not in the request body.
+    agent_fqn = os.getenv("SNOWFLAKE_CORTEX_AGENT", "TFCU_DEMO.PUBLIC.SACHIN_AGENT")
+    fqn_parts = [p for p in agent_fqn.replace('"', "").split(".") if p]
+    if len(fqn_parts) != 3:
+        return {
+            "error": f"SNOWFLAKE_CORTEX_AGENT must be DB.SCHEMA.NAME, got '{agent_fqn}'"
+        }
+    db, schema, name = fqn_parts
+
+    endpoint = (
+        f"https://{host}/api/v2/databases/{db}/schemas/{schema}/agents/{name}:run"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {pat}",
+        "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    # Stateless multi-turn request: no thread_id; `messages` carries the full
+    # conversation history followed by the current user message. Per the docs,
+    # when no thread_id is used the messages array includes the conversation
+    # history and the current message.
+    messages = []
+    for turn in (history or []):
+        if not isinstance(turn, dict):
+            continue
+        role = turn.get("role")
+        text = turn.get("text", "")
+        if role in ("user", "assistant") and isinstance(text, str) and text.strip():
+            messages.append(
+                {"role": role, "content": [{"type": "text", "text": text}]}
+            )
+    messages.append({"role": "user", "content": [{"type": "text", "text": question}]})
+
+    body = {"messages": messages, "stream": False}
+
+    try:
+        resp = requests.post(endpoint, headers=headers, json=body, timeout=120)
+    except requests.RequestException as exc:
+        return {"error": f"Network error reaching Snowflake: {exc}"}
+
+    if not resp.ok:
+        return {
+            "error": f"Cortex Agent returned {resp.status_code}",
+            "details": resp.text[:1000],
+        }
+
+    raw_text = resp.text.strip()
+    answer = ""
+    sql = ""
+    columns = []
+    rows = []
+
+    # Preferred path (stream=false, Accept: application/json): a single JSON
+    # object shaped like the assistant message:
+    #   {"role": "assistant", "content": [ ... {"type": "text", "text": "..."} ]}
+    data = None
+    try:
+        data = _json.loads(raw_text)
+    except _json.JSONDecodeError:
+        data = None
+
+    if isinstance(data, dict):
+        content = data.get("content")
+        if not content and isinstance(data.get("message"), dict):
+            content = data["message"].get("content")
+        answer = _collect_agent_text(content)
+        sql, columns, rows = _extract_sql_and_data(content)
+
+    # Fallback path: some deployments stream Server-Sent Events even when
+    # stream=false. Lines look like `data: {...json...}`; the final `response`
+    # event (and delta events) carry the assistant content.
+    if (not answer and not rows) and "data:" in raw_text:
+        for line in raw_text.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if payload in ("[DONE]", ""):
+                continue
+            try:
+                chunk = _json.loads(payload)
+            except _json.JSONDecodeError:
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            chunk_content = chunk.get("content")
+            answer += _collect_agent_text(chunk_content)
+            c_sql, c_cols, c_rows = _extract_sql_and_data(chunk_content)
+            if c_sql and not sql:
+                sql = c_sql
+            if c_cols and not columns:
+                columns = c_cols
+            if c_rows and not rows:
+                rows = c_rows
+            delta = chunk.get("delta")
+            if isinstance(delta, dict):
+                answer += _collect_agent_text(delta.get("content"))
+                if isinstance(delta.get("text"), str):
+                    answer += delta["text"]
+
+    if not answer and not rows:
+        return {"error": "Could not parse Cortex Agent response", "raw": raw_text[:500]}
+
+    return {
+        "answer": answer.strip(),
+        "sql": sql.strip() if isinstance(sql, str) else "",
+        "columns": columns,
+        "rows": rows,
+    }
+
+
 @app.get("/")
 def index():
     return render_template("index.html")
@@ -308,6 +509,114 @@ def create_realtime_session():
     )
 
 
+# Q3 must name a retrievable subject in the query itself — Q1/Q2 do not substitute.
+_Q3_MEASURABLE_ANCHORS = (
+    "loan", "lending", "mortgage", "deposit", "member", "membership",
+    "delinquency", "overdue", "charge-off", "charge off", "origination",
+    "application", "approval", "denial", "volume", "balance", "growth",
+    "attrition", "branch", "portfolio", "interest rate", "transaction",
+    "payment", "overdraft", "fraud", "incident", "vulnerability",
+    "penetration", "pci", "sox", "remediation", "breach", "exposure",
+    "nps", "satisfaction", "headcount", "budget", "expense", "revenue",
+    "margin", "spread", "yield", "pipeline", "sla", "uptime", "downtime",
+    "severity", "open ticket", "alert count", "case count",
+)
+
+_Q3_BARE_CATEGORY_PHRASES = (
+    "critical findings",
+    "the findings",
+    "findings",
+    "the issues",
+    "issues",
+    "the data",
+    "show me data",
+    "give me data",
+    "the numbers",
+    "the results",
+    "security data",
+    "cybersecurity data",
+)
+
+
+def _q3_content_words(query: str) -> list[str]:
+    q = re.sub(r"[^\w\s]", " ", query.lower())
+    q = " ".join(q.split())
+    filler = {
+        "what", "are", "the", "a", "an", "is", "there", "any", "me", "show",
+        "give", "tell", "i", "want", "need", "please", "can", "you", "for",
+        "my", "our", "of", "in", "on", "to", "how", "many", "much",
+    }
+    return [w for w in q.split() if w not in filler]
+
+
+def _q3_has_measurable_subject(query: str) -> bool:
+    q = query.lower()
+    return any(anchor in q for anchor in _Q3_MEASURABLE_ANCHORS)
+
+
+def _q3_is_bare_category_query(query: str) -> bool:
+    """True when Q3 is only a generic label, not a concrete data request."""
+    content_words = _q3_content_words(query)
+    if not content_words:
+        return True
+    joined = " ".join(content_words)
+    for phrase in _Q3_BARE_CATEGORY_PHRASES:
+        if joined == phrase or joined.endswith(phrase) or phrase in joined:
+            if len(content_words) <= 5:
+                return True
+    if set(content_words) <= {"critical", "findings"}:
+        return True
+    if set(content_words) <= {"security", "findings", "critical"}:
+        return True
+    if len(content_words) <= 3 and not _q3_has_measurable_subject(query):
+        return True
+    return False
+
+
+def _coaching_for_vague_q3(query: str, data_preference: str, business_unit: str) -> str:
+    has_time = bool(
+        data_preference
+        and re.search(
+            r"year[- ]?over[- ]?year|yoy|month[- ]?over[- ]?month|mom|quarter|"
+            r"monthly|weekly|annual|trend",
+            data_preference,
+            re.I,
+        )
+    )
+    unit_hint = ""
+    if business_unit and business_unit.lower() not in ("unspecified", "teachers fcu", ""):
+        unit_hint = f" for {business_unit}"
+    if has_time:
+        return (
+            f"I have your report style and comparison basis{unit_hint}, but I still "
+            "need the specific metric or dataset in your query — for example open "
+            "critical security findings by severity, loan delinquency rate, or "
+            "deposit growth by branch."
+        )
+    return (
+        "Please name the specific metric or dataset you want to retrieve — for "
+        "example loan volume, member growth rate, open critical security findings, "
+        "or deposit balance by branch."
+    )
+
+
+def _enforce_q3_specificity_gate(
+    result: dict, query: str, data_preference: str, business_unit: str, strict: bool
+) -> dict:
+    """Override overly lenient LLM accepts for bare Q3 phrases."""
+    if not strict or not result.get("valid"):
+        return result
+    # Q1 business unit alone does not make a bare Q3 specific enough.
+    if _q3_is_bare_category_query(query) or (
+        len(_q3_content_words(query)) <= 5 and not _q3_has_measurable_subject(query)
+    ):
+        return {
+            "valid": False,
+            "suggestion": _coaching_for_vague_q3(query, data_preference, business_unit),
+        }
+    return result
+
+
 @app.post("/api/validate-query")
 def validate_query():
     """
@@ -322,6 +631,7 @@ def validate_query():
     payload = request.get_json(silent=True) or {}
     query = _sanitize_text(str(payload.get("query", "")))
     business_unit = _sanitize_text(str(payload.get("business_unit", "")))
+    data_preference = _sanitize_text(str(payload.get("data_preference", "")))
     history = payload.get("history", [])
     # Optional strict mode — opt-in flag used by the typed Q3 flow only.
     # When true, the validator applies a higher quality bar (requires both a
@@ -333,27 +643,62 @@ def validate_query():
     if not query:
         return _error("query is required")
 
+    intake_text = ""
+    if business_unit or data_preference:
+        intake_lines = []
+        if business_unit:
+            intake_lines.append(f"- Q1 business unit (locked): {business_unit}")
+        if data_preference:
+            intake_lines.append(
+                f"- Q2 data preference (locked): {data_preference} "
+                "(includes report type and often comparison/time focus such as "
+                "year over year, month over month, or by branch)"
+            )
+        intake_text = (
+            "\n\nPRIOR INTAKE ANSWERS — already captured, authoritative:\n"
+            + "\n".join(intake_lines)
+            + "\n"
+            "- NEVER ask the user to repeat or clarify anything already stated "
+            "in Q1 or Q2 above (business unit, metrics vs trends vs reports, "
+            "year-over-year, month-over-month, branch focus, etc.).\n"
+            "- When validating Q3, merge Q1 + Q2 + Q3 + conversation history "
+            "into one composite query. Q3 is the specific subject/metric; Q2 "
+            "supplies report style and scope; Q1 supplies business unit context.\n"
+            "- If Q2 mentions year over year, YoY, month over month, MoM, or "
+            "similar, that satisfies the time/comparison scope — do NOT ask for "
+            "it again on Q3.\n"
+            "- If Q2 mentions metrics, trends, or reports, that satisfies the "
+            "data-type dimension — do NOT ask for report type again on Q3.\n"
+            "- Q1 and Q2 do NOT replace a vague Q3. The user must still state a "
+            "concrete metric, dataset, or analysis subject IN Q3 (or in Q3 "
+            "conversation turns) — e.g. loan delinquency rate, open security "
+            "incidents by severity, deposit balance by branch.\n"
+            "- Reject bare category questions like 'what are the critical "
+            "findings', 'show me findings', 'give me the data' — these name a "
+            "bucket, not a retrievable measure, even when Q2 says year over year "
+            "reports.\n"
+            "- Reject when Q3 omits time/report type only if Q2 also omitted them; "
+            "do NOT re-ask for those when Q2 already has them."
+        )
+
     strict_rules_text = ""
     if strict:
         strict_rules_text = (
-            "\n\nSTRICT MODE — additional rules (typed Q3 flow):\n"
-            "- A bare entity reference like 'give me members', 'show me loans', "
-            "'I want deposits', 'pull accounts' is NOT enough. These name a "
-            "subject but specify no measurement and no scope. They MUST be "
-            "rejected unless the conversation history already supplies both a "
-            "measurement (count, total, average, growth, delinquency rate, "
-            "balance, volume, etc.) AND a scope (time range, segment, "
-            "branch, product line, comparison basis, etc.).\n"
-            "- Single-word or very short queries (under 5 words) without "
-            "supporting history context are almost always too vague — reject "
-            "them with a suggestion asking for what specifically they want to "
-            "measure or how they want it scoped.\n"
-            "- Do NOT auto-resolve a vague query by inventing a default "
-            "measurement or default time period. If the user did not say it "
-            "and history did not say it, ask — don't assume.\n"
-            "- When asking, request the SINGLE most important missing piece "
-            "(usually measurement OR scope, whichever is absent), not both at "
-            "once."
+            "\n\nSTRICT MODE — additional rules (Q3 validation):\n"
+            "- A bare entity or category reference is NOT enough: 'critical findings', "
+            "'findings', 'issues', 'give me data', 'show me reports' must be REJECTED "
+            "unless Q3 also names a concrete measurable (count, rate, volume, balance, "
+            "specific incident type, named KPI, etc.).\n"
+            "- Q2 'year over year reports' plus Q3 'critical findings' is INVALID — "
+            "YoY is scope, not the subject. Ask for the specific metric/dataset only.\n"
+            "- Short Q3 is valid only when it contains a measurable anchor (e.g. "
+            "'loan delinquency rate', 'open PCI findings count').\n"
+            "- Do NOT invent defaults the user never said. But DO use Q1/Q2 "
+            "intake answers as established facts — that is not inventing.\n"
+            "- When coaching, request only the ONE dimension still missing "
+            "after merging ALL intake and history. Never re-ask for year over "
+            "year, time range, business unit, or metrics/trends/reports if "
+            "already captured in Q1, Q2, or prior turns."
         )
 
     # Build history context string for the prompt
@@ -437,6 +782,7 @@ def validate_query():
                                     "- Do not invent table or column names\n"
                                     "- End with a period, not a question mark\n"
                                     "Never include markdown, code fences, or extra keys."
+                                    f"{intake_text}"
                                     f"{strict_rules_text}"
                                     f"{history_text}"
                                 ),
@@ -448,7 +794,11 @@ def validate_query():
                         "content": [
                             {
                                 "type": "input_text",
-                                "text": f"Business unit: {business_unit or 'Teachers FCU'}\nQuery: {query}",
+                                "text": (
+                                    f"Business unit (Q1): {business_unit or 'Teachers FCU'}\n"
+                                    f"Data preference (Q2): {data_preference or '(not provided)'}\n"
+                                    f"Query (Q3): {query}"
+                                ),
                             }
                         ],
                     },
@@ -468,6 +818,24 @@ def validate_query():
     try:
         import json as _json
         result = _json.loads(raw)
+        result = _enforce_q3_specificity_gate(
+            result, query, data_preference, business_unit, strict
+        )
+        if result.get("valid"):
+            resolved = _sanitize_text(str(result.get("resolved_query", "")))
+            merged_parts = []
+            if business_unit:
+                merged_parts.append(f"for {business_unit}")
+            if data_preference:
+                merged_parts.append(data_preference)
+            if query:
+                merged_parts.append(query)
+            if merged_parts:
+                full_merged = ", ".join(merged_parts)
+                if not resolved or len(resolved) < len(full_merged) * 0.5:
+                    result["resolved_query"] = full_merged
+                elif data_preference and data_preference.lower() not in resolved.lower():
+                    result["resolved_query"] = f"{data_preference}, {resolved}"
         return jsonify(result)
     except Exception:
         return jsonify({"valid": True})  # fail open
@@ -657,7 +1025,7 @@ def extract_answer():
     question_map = {
         0: "Which business unit are you with?",
         1: Q2_INTAKE_QUESTION,
-        2: "What specific query would you like relayed to the data system?",
+        2: "This is question three, the user's actual query: what specific query would you like me to run?",
     }
     current_question = question_map.get(step, "What are you looking for?")
 
@@ -733,7 +1101,7 @@ def bridge_interrupt():
     question_map = {
         0: "Which business unit are you with?",
         1: Q2_INTAKE_QUESTION,
-        2: "What specific query would you like relayed to the data system?",
+        2: "This is question three, the user's actual query: what specific query would you like me to run?",
     }
     current_question = question_map.get(step, "What are you looking for?")
 
@@ -1009,6 +1377,93 @@ def submit_ticket():
 
     TICKETS.insert(0, ticket)
     return jsonify({"message": "ticket received", "ticket": ticket}), 201
+
+
+# Phrases that indicate the agent could not answer from the semantic layer,
+# i.e. the Q3 query was irrelevant / out of scope for the available data.
+_CORTEX_NO_DATA_PHRASES = (
+    "i don't have", "i do not have", "i cannot", "i can't", "i'm not able",
+    "not able to answer", "no data", "not found", "unable to answer",
+    "out of scope", "not covered", "not available in", "cannot find",
+    "no information", "not support", "does not contain", "doesn't contain",
+    "no relevant", "not within",
+)
+
+
+@app.post("/api/ask-cortex")
+def ask_cortex():
+    """
+    Receives the three intake answers — Q1 business_unit, Q2 data_type,
+    Q3 query — builds a single natural language question, relays it to the
+    Snowflake Cortex Agent (which routes through the configured semantic view),
+    and returns the natural-language answer plus the generated SQL and data.
+
+    If the Q3 query is irrelevant / not covered by the semantic layer, the
+    response is flagged with irrelevant: true so the frontend can show the
+    dedicated "not found in our data" message.
+    """
+    payload = request.get_json(silent=True) or {}
+    business_unit = _sanitize_text(str(payload.get("business_unit", "")))
+    data_type = _sanitize_text(str(payload.get("data_type", "")))
+    query = _sanitize_text(str(payload.get("query", "")))
+
+    if not query:
+        return _error("query is required")
+
+    # Sanitize any prior conversation turns sent by the frontend so the agent
+    # can refine its answer with full context. Keep the last 20 turns.
+    raw_history = payload.get("history")
+    history = []
+    if isinstance(raw_history, list):
+        for turn in raw_history[-20:]:
+            if not isinstance(turn, dict):
+                continue
+            role = str(turn.get("role", "")).strip().lower()
+            text = _sanitize_text(str(turn.get("text", "")))
+            if role in ("user", "assistant") and text:
+                history.append({"role": role, "text": text})
+
+    if history:
+        # A follow-up turn: `query` is the raw refinement; the three-answer
+        # composition only applies to the very first message.
+        question = query
+    else:
+        # First turn: build one natural language question from all three answers.
+        parts = []
+        if business_unit and business_unit.lower() not in ("unspecified", ""):
+            parts.append(f"For the {business_unit} business unit")
+        if data_type:
+            parts.append(f"looking at {data_type}")
+        parts.append(query)
+        question = ", ".join(parts)
+
+    result = _call_cortex_agent(question, history=history)
+
+    if result.get("error"):
+        return jsonify({
+            "ok": False,
+            "error": result["error"],
+            "details": result.get("details", ""),
+        }), 502
+
+    answer = result.get("answer", "")
+    rows = result.get("rows", [])
+
+    # The query is irrelevant to the semantic layer if the agent returned no
+    # usable answer and no data, or its answer is an out-of-scope refusal.
+    answer_lc = answer.lower()
+    refused = any(p in answer_lc for p in _CORTEX_NO_DATA_PHRASES)
+    is_irrelevant = (not answer and not rows) or (refused and not rows)
+
+    return jsonify({
+        "ok": True,
+        "answer": answer,
+        "sql": result.get("sql", ""),
+        "columns": result.get("columns", []),
+        "rows": rows,
+        "irrelevant": is_irrelevant,
+        "question": question,
+    })
 
 
 if __name__ == "__main__":

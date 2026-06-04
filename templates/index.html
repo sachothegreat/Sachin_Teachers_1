@@ -590,6 +590,217 @@
         realtimeJsonEl.scrollTop = realtimeJsonEl.scrollHeight;
       }
       function clearTranscript() { realtimeJsonEl.innerHTML = ""; }
+
+      // ---- Cortex Agent relay (semantic layer) ----
+      const CORTEX_IRRELEVANT_MSG =
+        "I wasn't able to find that in our data — it doesn't look like it's " +
+        "covered by the semantic layer. Try rephrasing around things like loans, " +
+        "deposits, members, delinquency, branches, or security findings.";
+
+      // Running conversation with the Cortex Agent so follow-ups refine the
+      // previous answer. Each entry is { role: "user"|"assistant", text }.
+      let cortexConversation = [];
+
+      // Relays a turn to the Cortex Agent. On the first turn pass the collected
+      // answers; for a follow-up pass { followupText }. The running
+      // conversation is always sent so the agent keeps context. Returns
+      // { ok, answer, sql, columns, rows, irrelevant, question } or { error }.
+      async function relayToCortex(answers, opts) {
+        opts = opts || {};
+        const body = opts.followupText
+          ? { query: opts.followupText, history: cortexConversation }
+          : {
+              business_unit: (answers && answers.business_unit) || "Unspecified",
+              data_type: (answers && answers.summary) || "",
+              query: (answers && (answers.details || answers.summary)) || "",
+              history: cortexConversation,
+            };
+        try {
+          const resp = await fetch("/api/ask-cortex", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok || !data.ok) {
+            return { error: (data && data.error) || `Request failed (${resp.status})` };
+          }
+          return data;
+        } catch (err) {
+          return { error: err.message || "Network error" };
+        }
+      }
+
+      // Records a completed turn (user message + assistant answer) so the next
+      // follow-up carries full context.
+      function recordCortexTurn(data, userTextFallback) {
+        cortexConversation.push({ role: "user", text: data.question || userTextFallback || "" });
+        cortexConversation.push({ role: "assistant", text: data.answer || CORTEX_IRRELEVANT_MSG });
+      }
+
+      // Generic follow-up handler: relays the refinement with history, records
+      // the turn, then re-renders the result into the same target.
+      async function handleCortexFollowup(text, renderFn, statusFn, doneCb) {
+        statusFn("Working on that...");
+        const data = await relayToCortex(null, { followupText: text });
+        if (doneCb) doneCb();
+        if (data.error) {
+          statusFn("I'm having trouble reaching the data system right now. Please try again.");
+          return;
+        }
+        recordCortexTurn(data, text);
+        const irrelevant = data.irrelevant || (!data.answer && !(data.rows && data.rows.length));
+        renderFn(data);
+        statusFn(irrelevant ? "Query not found in our data." : "Results ready.");
+        speakWithNaturalVoice(irrelevant ? CORTEX_IRRELEVANT_MSG : data.answer);
+      }
+
+      // Builds a DOM node showing the natural-language answer plus the
+      // generated SQL and a data table from the semantic view. `onFollowup`
+      // (text, doneCb) is invoked when the user submits a refinement.
+      function buildCortexResultNode(data, onFollowup) {
+        const wrap = document.createElement("div");
+        wrap.className = "cortex-result";
+        wrap.style.cssText =
+          "color:#cbd5e1;text-align:left;background:rgba(255,255,255,0.04);" +
+          "border-radius:8px;padding:10px 12px;margin-top:6px;align-self:stretch;" +
+          "max-width:100%;font-size:0.85rem;line-height:1.5;";
+
+        if (data.irrelevant || (!data.answer && !(data.rows && data.rows.length))) {
+          wrap.textContent = "Syntheia: " + CORTEX_IRRELEVANT_MSG;
+          return wrap;
+        }
+
+        if (data.answer) {
+          const ans = document.createElement("div");
+          ans.textContent = "Syntheia: " + data.answer;
+          ans.style.cssText = "margin-bottom:8px;color:#e2e8f0;";
+          wrap.appendChild(ans);
+        }
+
+        if (data.sql) {
+          const label = document.createElement("div");
+          label.textContent = "Generated SQL";
+          label.style.cssText =
+            "font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;" +
+            "color:#64748b;margin:6px 0 2px;";
+          const pre = document.createElement("pre");
+          pre.textContent = data.sql;
+          pre.style.cssText =
+            "white-space:pre-wrap;word-break:break-word;background:rgba(2,6,23,0.6);" +
+            "border-radius:6px;padding:8px;font-size:0.78rem;color:#7dd3fc;overflow-x:auto;margin:0;";
+          wrap.appendChild(label);
+          wrap.appendChild(pre);
+        }
+
+        if (Array.isArray(data.rows) && data.rows.length) {
+          const cols = (data.columns && data.columns.length)
+            ? data.columns
+            : (Array.isArray(data.rows[0]) ? data.rows[0].map((_, i) => "col" + (i + 1)) : ["value"]);
+          const tbl = document.createElement("table");
+          tbl.style.cssText =
+            "border-collapse:collapse;margin-top:8px;width:100%;font-size:0.78rem;";
+          const thead = document.createElement("thead");
+          const htr = document.createElement("tr");
+          cols.forEach((c) => {
+            const th = document.createElement("th");
+            th.textContent = c;
+            th.style.cssText =
+              "border:1px solid rgba(148,163,184,0.25);padding:4px 8px;text-align:left;" +
+              "color:#94a3b8;background:rgba(255,255,255,0.03);";
+            htr.appendChild(th);
+          });
+          thead.appendChild(htr);
+          tbl.appendChild(thead);
+          const tbody = document.createElement("tbody");
+          data.rows.slice(0, 50).forEach((r) => {
+            const tr = document.createElement("tr");
+            (Array.isArray(r) ? r : [r]).forEach((cell) => {
+              const td = document.createElement("td");
+              td.textContent = (cell === null || cell === undefined) ? "" : String(cell);
+              td.style.cssText =
+                "border:1px solid rgba(148,163,184,0.18);padding:4px 8px;color:#cbd5e1;";
+              tr.appendChild(td);
+            });
+            tbody.appendChild(tr);
+          });
+          tbl.appendChild(tbody);
+          wrap.appendChild(tbl);
+        }
+
+        // Follow-up input — lets the user refine or ask a related question
+        // with full conversation context.
+        if (typeof onFollowup === "function") {
+          const fu = document.createElement("div");
+          fu.className = "cortex-followup";
+          fu.style.cssText = "display:flex;gap:6px;margin-top:10px;";
+          const input = document.createElement("input");
+          input.type = "text";
+          input.placeholder = "Refine or ask a follow-up…";
+          input.style.cssText =
+            "flex:1;padding:6px 10px;border-radius:6px;border:1px solid rgba(148,163,184,0.3);" +
+            "background:rgba(2,6,23,0.5);color:#e2e8f0;font-size:0.82rem;";
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.textContent = "Send";
+          btn.style.cssText =
+            "padding:6px 14px;border-radius:6px;border:none;background:#0ea5e9;color:#04141f;" +
+            "font-weight:600;cursor:pointer;font-size:0.82rem;";
+          const submit = () => {
+            const t = String(input.value || "").trim();
+            if (!t) return;
+            input.disabled = true;
+            btn.disabled = true;
+            btn.textContent = "…";
+            onFollowup(t, () => {
+              input.disabled = false;
+              btn.disabled = false;
+              btn.textContent = "Send";
+              input.value = "";
+            });
+          };
+          btn.addEventListener("click", submit);
+          input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") { e.preventDefault(); submit(); }
+          });
+          fu.appendChild(input);
+          fu.appendChild(btn);
+          wrap.appendChild(fu);
+        }
+
+        return wrap;
+      }
+
+      // Appends a result block into the live transcript panel. Older follow-up
+      // boxes are removed so only the latest answer is interactive.
+      function showCortexInTranscript(data) {
+        realtimeJsonEl.querySelectorAll(".cortex-followup").forEach((n) => n.remove());
+        const node = buildCortexResultNode(data, (text, done) =>
+          handleCortexFollowup(
+            text,
+            showCortexInTranscript,
+            (s) => { realtimeStatusEl.textContent = s; },
+            done
+          )
+        );
+        realtimeJsonEl.appendChild(node);
+        realtimeJsonEl.scrollTop = realtimeJsonEl.scrollHeight;
+      }
+
+      // Renders a result block into a panel, replacing any previous result.
+      function showCortexInPanel(hostEl, statusEl, data) {
+        if (!hostEl) return;
+        hostEl.querySelectorAll(".cortex-result").forEach((n) => n.remove());
+        const node = buildCortexResultNode(data, (text, done) =>
+          handleCortexFollowup(
+            text,
+            (d) => showCortexInPanel(hostEl, statusEl, d),
+            (s) => { if (statusEl) statusEl.textContent = s; },
+            done
+          )
+        );
+        hostEl.appendChild(node);
+      }
       const startRealtimeBtn = document.getElementById("start-realtime");
       const stopSpeakingBtn = document.getElementById("stop-speaking");
       const startTypedIntakeBtn = document.getElementById("start-typed-intake");
@@ -657,10 +868,12 @@
       const Q2_INTAKE_PROMPT =
         "Please specify what kind of data you want: metrics, trends, or reports. " +
         "If you have a specific focus, like year over year, month over month, or by branch, include that too.";
+      const Q3_QUERY_PROMPT =
+        "What query would you like relayed?";
       const voiceIntakeQuestions = [
         "Which business unit are you with?",
         Q2_INTAKE_PROMPT,
-        "What query would you like relayed?",
+        Q3_QUERY_PROMPT,
       ];
       const voiceIntakeKeys = ["business_unit", "summary", "details"];
       let voiceIntakeStep = 0;
@@ -831,7 +1044,13 @@
         return Promise.race([fetchCall, timeout]);
       }
 
-      async function validateBankingQuery(query, businessUnit = "", historyOverride = null, strict = false) {
+      async function validateBankingQuery(
+        query,
+        businessUnit = "",
+        historyOverride = null,
+        strict = false,
+        dataPreference = ""
+      ) {
         const timeout = new Promise(resolve =>
           setTimeout(() => resolve({ valid: true }), 3000) // fail open after 3s
         );
@@ -846,6 +1065,7 @@
               body: JSON.stringify({
                 query,
                 business_unit: businessUnit,
+                data_preference: dataPreference,
                 history: historyToSend,
                 strict: !!strict,
               }),
@@ -967,7 +1187,7 @@
       const typedIntakeQuestions = [
         { key: "business_unit", prompt: "Which business unit are you with?" },
         { key: "summary", prompt: Q2_INTAKE_PROMPT },
-        { key: "details", prompt: "What query would you like relayed? Please be specific and banking-related." },
+        { key: "details", prompt: Q3_QUERY_PROMPT + " Please be specific and banking-related." },
       ];
       let typedIntakeAnswers = {};
       let typedIntakeIndex = 0;
@@ -1317,27 +1537,19 @@
       }
 
       async function submitTypedIntake2() {
-        const finalPayload = {
-          requestor_name: "Teachers Employee",
-          business_unit: typedIntake2Answers.business_unit || "Unspecified",
-          summary: typedIntake2Answers.summary || "Data request",
-          priority: "medium",
-          metric: typedIntake2Answers.summary || "unspecified",
-          time_period: "current",
-          confidence: 0.9,
-          filters: {},
-          details: typedIntake2Answers.summary || "",
-          source: "typed_intake_alt",
-        };
-
+        cortexConversation = [];
         typed2StatusEl.textContent = "Please hold on while I fetch you the results...";
-        try {
-          await submitStructuredTicket(finalPayload);
-          typed2StatusEl.textContent = "Results ready.";
-          loadTickets();
-        } catch (error) {
-          typed2StatusEl.textContent = `Typed intent failed: ${error.message}`;
+        const data = await relayToCortex(typedIntake2Answers);
+        if (data.error) {
+          typed2StatusEl.textContent =
+            "I'm having trouble reaching the data system right now. Please try again in a moment.";
+          return;
         }
+        recordCortexTurn(data, "");
+        const isIrrelevant = data.irrelevant || (!data.answer && !(data.rows && data.rows.length));
+        typed2StatusEl.textContent = isIrrelevant ? "Query not found in our data." : "Results ready.";
+        showCortexInPanel(typed2StatusEl.parentNode, typed2StatusEl, data);
+        speakWithNaturalVoice(isIrrelevant ? CORTEX_IRRELEVANT_MSG : data.answer);
       }
 
       async function handleTypedNext2() {
@@ -1394,12 +1606,12 @@
           const historyForValidation2 = contextTurns2.concat(typedQ3History2);
           // After several rejected attempts, fall open so the user can never
           // get stuck in a loop hearing the same coaching back.
-          const useStrict2 = typedQ3Attempts2 < TYPED_Q3_MAX_ATTEMPTS;
           const validation = await validateBankingQuery(
             answer,
             typedIntake2Answers.business_unit || "",
             historyForValidation2,
-            useStrict2
+            true,
+            typedIntake2Answers.summary || ""
           );
           if (!validation.valid && typedQ3Attempts2 < TYPED_Q3_MAX_ATTEMPTS) {
             const coaching = validation.suggestion || "That's a bit vague or off-topic. Please ask something specific and banking-related.";
@@ -1426,28 +1638,20 @@
       }
 
       async function submitTypedIntake() {
-        const finalPayload = {
-          requestor_name: "Teachers Employee",
-          business_unit: typedIntakeAnswers.business_unit || "Unspecified",
-          summary: typedIntakeAnswers.summary || "Data request",
-          priority: "medium",
-          metric: typedIntakeAnswers.summary || "unspecified",
-          time_period: "current",
-          confidence: 0.9,
-          filters: {},
-          details: typedIntakeAnswers.summary || "",
-          source: "typed_intake",
-        };
-
-        // transcript panel shows conversation, not JSON
+        cortexConversation = [];
         realtimeStatusEl.textContent = "Please hold on while I fetch you the results...";
-        try {
-          await submitStructuredTicket(finalPayload);
-          realtimeStatusEl.textContent = "Results ready.";
-          loadTickets();
-        } catch (error) {
-          realtimeStatusEl.textContent = `Typed intent failed: ${error.message}`;
+        appendTranscript("Syntheia", "Got it — relaying that to the data system now.");
+        const data = await relayToCortex(typedIntakeAnswers);
+        if (data.error) {
+          realtimeStatusEl.textContent = "Connection error.";
+          appendTranscript("Syntheia", "I'm having trouble reaching the data system right now. Please try again in a moment.");
+          return;
         }
+        recordCortexTurn(data, "");
+        const isIrrelevant = data.irrelevant || (!data.answer && !(data.rows && data.rows.length));
+        showCortexInTranscript(data);
+        realtimeStatusEl.textContent = isIrrelevant ? "Query not found in our data." : "Results ready.";
+        speakWithNaturalVoice(isIrrelevant ? CORTEX_IRRELEVANT_MSG : data.answer);
       }
 
       async function handleTypedNext() {
@@ -1504,12 +1708,12 @@
           const historyForValidation = contextTurns.concat(typedQ3History);
           // After several rejected attempts, fall open so the user can never
           // get stuck in a loop hearing the same coaching back.
-          const useStrict = typedQ3Attempts < TYPED_Q3_MAX_ATTEMPTS;
           const validation = await validateBankingQuery(
             answer,
             typedIntakeAnswers.business_unit || "",
             historyForValidation,
-            useStrict
+            true,
+            typedIntakeAnswers.summary || ""
           );
           if (!validation.valid && typedQ3Attempts < TYPED_Q3_MAX_ATTEMPTS) {
             const coaching = validation.suggestion || "That's a bit vague or off-topic. Please ask something specific and banking-related.";
@@ -1680,32 +1884,22 @@
       }
 
       async function finalizeVoiceIntake() {
-        const payload = {
-          requestor_name: "Teachers Employee",
-          business_unit: voiceIntakeAnswers.business_unit || "Unspecified",
-          summary: voiceIntakeAnswers.summary || "Data request",
-          priority: "medium",
-          metric: voiceIntakeAnswers.summary || "unspecified",
-          time_period: "current",
-          confidence: 0.95,
-          filters: {},
-          details: voiceIntakeAnswers.summary || "Data request",
-          source: "openai_realtime",
-        };
-
-        // transcript panel shows conversation, not JSON
+        intentSubmitted = true;
+        cortexConversation = [];
         realtimeStatusEl.textContent = "Fetching your results...";
         speakWithNaturalVoice("Please hold on while I fetch you the results.", async () => {
-          try {
-            await submitStructuredTicket(payload);
-            intentSubmitted = true;
-            realtimeStatusEl.textContent = "Results ready.";
-            loadTickets();
+          const data = await relayToCortex(voiceIntakeAnswers);
+          if (data.error) {
+            realtimeStatusEl.textContent = "Connection error.";
+            appendTranscript("Syntheia", "I'm having trouble reaching the data system right now.");
             stopRealtime();
-          } catch (error) {
-            intentSubmitted = false;
-            realtimeStatusEl.textContent = `Request failed: ${error.message}`;
+            return;
           }
+          recordCortexTurn(data, "");
+          const isIrrelevant = data.irrelevant || (!data.answer && !(data.rows && data.rows.length));
+          showCortexInTranscript(data);
+          realtimeStatusEl.textContent = isIrrelevant ? "Query not found in our data." : "Results ready.";
+          speakWithNaturalVoice(isIrrelevant ? CORTEX_IRRELEVANT_MSG : data.answer, () => stopRealtime());
         });
       }
 
@@ -1967,18 +2161,16 @@
                 voiceIntakeAnswers[key] = extracted;
                 pendingVoiceConfirmation = null;
                 voiceIntakeStep = 2;
-                const bridgeText = String(bridgeResult.bridge_response || "").trim();
-                const alreadyAsksQ3 =
-                  /\?$/.test(bridgeText) ||
-                  /what specific query/i.test(bridgeText) ||
-                  /what query/i.test(bridgeText);
                 realtimeStatusEl.textContent = `Captured (Q2): ${shortEcho(extracted)} — moving to Q3`;
-                if (bridgeText) {
-                  if (alreadyAsksQ3) {
-                    speakWithNaturalVoice(bridgeText);
-                  } else {
-                    askCurrentVoiceQuestion(bridgeText.replace(/[.!?]+$/, "") + ". And lastly,");
-                  }
+                // Keep only the confirming part of the bridge response. The bridge
+                // sometimes appends its own follow-up question (e.g. re-asking the
+                // business unit), which would derail the flow and replace the real
+                // Q3 prompt. Strip any trailing question so we always go on to ask
+                // the actual Q3 query question next.
+                let bridgeAck = String(bridgeResult.bridge_response || "").trim();
+                bridgeAck = bridgeAck.replace(/\s*[^.!?]*\?\s*$/, "").trim();
+                if (bridgeAck) {
+                  askCurrentVoiceQuestion(bridgeAck.replace(/[.!?]+$/, "") + ". And lastly,");
                 } else {
                   askCurrentVoiceQuestion("Got it. And lastly,");
                 }
@@ -1993,8 +2185,13 @@
               if (bridgeStep === 2) {
                 q3History.push({ role: "user", content: rawTranscript });
                 const voiceQ3HistoryBridge = buildVoiceQ3ValidationHistory();
-                const useStrictBridge = voiceQ3Attempts < VOICE_Q3_MAX_ATTEMPTS;
-                validateBankingQuery(extracted, voiceIntakeAnswers.business_unit || "", voiceQ3HistoryBridge, useStrictBridge).then(result => {
+                validateBankingQuery(
+                  extracted,
+                  voiceIntakeAnswers.business_unit || "",
+                  voiceQ3HistoryBridge,
+                  true,
+                  voiceIntakeAnswers.summary || ""
+                ).then(result => {
                   if (pendingVoiceConfirmation && pendingVoiceConfirmation.value === extracted) {
                     if (result.resolved_query) pendingVoiceConfirmation.value = result.resolved_query;
                     pendingVoiceConfirmation.validation = result;
@@ -2002,13 +2199,19 @@
                 });
               }
               speakWithNaturalVoice(ack);
-            } else {
-              // LLM couldn't extract an answer — acknowledge and re-ask current question
+              return;
+            }
+            // Bridge couldn't resolve or extract an answer from the interruption.
+            if (bridgeStep !== 2) {
+              // Not the final query step — acknowledge and re-ask the current question.
               const ack = bridgeResult.bridge_response
                 ? `${bridgeResult.bridge_response.replace(/[.!?]+$/, "")}. ` : "";
               askCurrentVoiceQuestion(ack || "Let me re-ask —");
+              return;
             }
-            return;
+            // Final query step (Q3): the user already stated their query while
+            // interrupting the prompt. Don't discard it and loop — fall through
+            // to the normal answer handling below so it gets captured and confirmed.
           }
 
           const step = voiceIntakeStep;
@@ -2079,8 +2282,13 @@
           // an infinite reject loop.
           if (step === 2) {
             const voiceQ3History = buildVoiceQ3ValidationHistory();
-            const useStrict = voiceQ3Attempts < VOICE_Q3_MAX_ATTEMPTS;
-            validateBankingQuery(rawTranscript, voiceIntakeAnswers.business_unit || "", voiceQ3History, useStrict).then(result => {
+            validateBankingQuery(
+              rawTranscript,
+              voiceIntakeAnswers.business_unit || "",
+              voiceQ3History,
+              true,
+              voiceIntakeAnswers.summary || ""
+            ).then(result => {
               if (pendingVoiceConfirmation) {
                 if (result.resolved_query) {
                   // Only use resolved_query if it adds specificity (≥ original word count).
