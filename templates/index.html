@@ -516,49 +516,25 @@
         <div class="btn-row">
           <button type="button" id="start-realtime">Start realtime voice</button>
           <button type="button" id="stop-speaking" class="secondary" disabled>Stop &amp; re-ask</button>
-          <button type="button" id="start-typed-intake" class="secondary">Type intent instead</button>
         </div>
         <div id="realtime-json" style="max-height:260px;overflow-y:auto;font-size:0.85rem;line-height:1.6;padding:8px 0;display:flex;flex-direction:column;gap:4px;"></div>
         <pre id="realtime-debug" class="panel-pre muted" style="display:none;"></pre>
-        <div id="typed-intake-panel" class="card card-inset" style="display: none;">
-          <h3>Typed intent intake</h3>
-          <p id="typed-question" class="muted"></p>
-          <input
-            id="typed-answer"
-            type="text"
-            class="form-input"
-            placeholder="Type your answer here"
-          />
-          <div class="btn-row mt">
-            <button type="button" id="typed-next">Next</button>
-            <button type="button" id="typed-cancel" class="secondary">Cancel</button>
-          </div>
+        <div id="typed-intake-panel" style="display:none;">
+          <p id="typed-question"></p>
+          <input id="typed-answer" type="text" />
+          <button type="button" id="typed-next"></button>
+          <button type="button" id="typed-cancel"></button>
         </div>
         <audio id="assistant-audio" autoplay></audio>
         <video id="camera-preview" autoplay playsinline muted></video>
         </div>
-      <div class="card">
-        <h3>Typed ticket (second path)</h3>
-        <p class="muted">
-          Same step-by-step questions as <strong>Type intent instead</strong> above — use this block when you want a separate typing area.
-        </p>
-        <div class="btn-row">
-          <button type="button" id="start-typed-intake-2" class="secondary">Start typed intake</button>
-        </div>
-        <p id="typed-2-status" class="muted" style="margin: 0 0 8px; min-height: 1.25em"></p>
-        <div id="typed-intake-panel-2" class="card card-inset" style="display: none">
-          <h3>Typed intent intake</h3>
-          <p id="typed-question-2" class="muted"></p>
-          <input
-            id="typed-answer-2"
-            type="text"
-            class="form-input"
-            placeholder="Type your answer here"
-          />
-          <div class="btn-row mt">
-            <button type="button" id="typed-next-2">Next</button>
-            <button type="button" id="typed-cancel-2" class="secondary">Cancel</button>
-          </div>
+      <div style="display:none;">
+        <p id="typed-2-status"></p>
+        <div id="typed-intake-panel-2">
+          <p id="typed-question-2"></p>
+          <input id="typed-answer-2" type="text" />
+          <button type="button" id="typed-next-2"></button>
+          <button type="button" id="typed-cancel-2"></button>
         </div>
       </div>
         </div>
@@ -866,12 +842,11 @@
       const MULTI_FACE_CONFIRMATION_THRESHOLD = 2;
       const intentReadyMarker = "INTENT_READY";
       const Q2_INTAKE_PROMPT =
-        "Please specify what kind of data you want: metrics, trends, or reports. " +
-        "If you have a specific focus, like year over year, month over month, or by branch, include that too.";
+        "Can I help you by giving you a metric, trend or report? Pick one.";
       const Q3_QUERY_PROMPT =
         "What query would you like relayed?";
       const voiceIntakeQuestions = [
-        "Which business unit are you with?",
+        "What domain are you looking for insights for?",
         Q2_INTAKE_PROMPT,
         Q3_QUERY_PROMPT,
       ];
@@ -1185,7 +1160,7 @@
         );
       }
       const typedIntakeQuestions = [
-        { key: "business_unit", prompt: "Which business unit are you with?" },
+        { key: "business_unit", prompt: "What domain are you looking for insights for?" },
         { key: "summary", prompt: Q2_INTAKE_PROMPT },
         { key: "details", prompt: Q3_QUERY_PROMPT + " Please be specific and banking-related." },
       ];
@@ -1671,6 +1646,15 @@
             typedAnswerEl.value = translated;
           }
         }
+        if (current.key === "business_unit") {
+          const isCyber = /cyber|cybersecurity|cyber security|infosec|information security|security/i.test(answer);
+          if (!isCyber) {
+            typedQuestionEl.textContent = "Wrong department. This system only supports cybersecurity insights. What domain are you looking for insights for?";
+            typedAnswerEl.value = "";
+            typedAnswerEl.focus();
+            return;
+          }
+        }
         if (current.key === "summary") {
           typedQuestionEl.textContent = "Checking your answer...";
           const q2Check = await acceptQ2Answer(answer);
@@ -1774,10 +1758,18 @@
         try { window.speechSynthesis.cancel(); } catch (_) {}
       }
 
+      function setMicMuted(muted) {
+        if (!mediaStream) return;
+        for (const track of mediaStream.getAudioTracks()) {
+          track.enabled = !muted;
+        }
+      }
+
       async function speakWithNaturalVoice(text, onEnd) {
         appendTranscript("Syntheia", text);
         const audio = assistantAudioEl;
         const thisSpeakJobId = ++speakJobId;
+        setMicMuted(true);
         try {
           audio.pause();
           audio.onended = null;
@@ -1812,6 +1804,7 @@
               URL.revokeObjectURL(url);
               currentTtsUrl = null;
             }
+            setMicMuted(false);
             if (onEnd) onEnd();
           };
           audio.onerror = (e) => {
@@ -1823,6 +1816,7 @@
               URL.revokeObjectURL(url);
               currentTtsUrl = null;
             }
+            setMicMuted(false);
             if (onEnd) onEnd();
           };
 
@@ -1842,6 +1836,7 @@
         } catch (error) {
           console.error("TTS failed:", error);
           realtimeStatusEl.textContent = `Voice error: ${error.message}`;
+          setMicMuted(false);
           if (onEnd) onEnd();
         }
       }
@@ -2053,6 +2048,17 @@
               // after that the validator was already called non-strict, so we
               // accept whatever came back to avoid trapping the user.
               if (step === 2) {
+                // Hardcoded time period check — runs before AI validation
+                const TIME_PERIOD_REGEX = /\b(today|this week|this month|this quarter|this year|last week|last month|last quarter|last year|last \d+ days?|last \d+ months?|year to date|ytd|month to date|mtd|\d{4}|january|february|march|april|may|june|july|august|september|october|november|december)\b/i;
+                const allQ3Text = q3History.map(t => t.content).join(" ") + " " + (value || "");
+                if (!TIME_PERIOD_REGEX.test(allQ3Text)) {
+                  voiceQ3Attempts += 1;
+                  pendingVoiceConfirmation = null;
+                  const timingMsg = "Could you also include a time period? For example, this month, last quarter, or last 30 days.";
+                  q3History.push({ role: "assistant", content: timingMsg });
+                  speakWithNaturalVoice(`${timingMsg} So let me ask again — what query would you like relayed?`);
+                  return;
+                }
                 if (validation === null) {
                   // Still validating — hold briefly and let user know
                   realtimeStatusEl.textContent = "Just a moment, checking your query...";
@@ -2065,6 +2071,17 @@
                   const coaching = validation.suggestion || "Try something more specific and banking-related.";
                   q3History.push({ role: "assistant", content: coaching });
                   speakWithNaturalVoice(`${coaching} So let me ask again — what query would you like relayed?`);
+                  return;
+                }
+              }
+              // Q1: only accept cybersecurity domain
+              if (step === 0) {
+                const isCyber = /cyber|cybersecurity|cyber security|infosec|information security|security/i.test(value);
+                if (!isCyber) {
+                  pendingVoiceConfirmation = null;
+                  const wrongMsg = "Wrong department. This system only supports cybersecurity insights. What domain are you looking for insights for?";
+                  realtimeStatusEl.textContent = "Wrong department.";
+                  speakWithNaturalVoice(wrongMsg);
                   return;
                 }
               }
@@ -2542,8 +2559,12 @@
 
       async function startRealtime() {
         if (!mediaStream) {
-          realtimeStatusEl.textContent = "Enable camera/mic permissions first.";
-          return;
+          realtimeStatusEl.textContent = "Requesting microphone access...";
+          await startDevices();
+          if (!mediaStream) {
+            realtimeStatusEl.textContent = "Microphone access is required. Please allow it in your browser and try again.";
+            return;
+          }
         }
         if (multiPersonBlocked) {
           realtimeStatusEl.textContent = "Cannot start: more than one person detected on camera.";

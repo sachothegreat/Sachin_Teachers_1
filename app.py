@@ -685,20 +685,25 @@ def validate_query():
     if strict:
         strict_rules_text = (
             "\n\nSTRICT MODE — additional rules (Q3 validation):\n"
-            "- A bare entity or category reference is NOT enough: 'critical findings', "
-            "'findings', 'issues', 'give me data', 'show me reports' must be REJECTED "
-            "unless Q3 also names a concrete measurable (count, rate, volume, balance, "
-            "specific incident type, named KPI, etc.).\n"
-            "- Q2 'year over year reports' plus Q3 'critical findings' is INVALID — "
-            "YoY is scope, not the subject. Ask for the specific metric/dataset only.\n"
-            "- Short Q3 is valid only when it contains a measurable anchor (e.g. "
-            "'loan delinquency rate', 'open PCI findings count').\n"
+            "- Q2 has ALREADY captured the data type (metric, trend, or report). "
+            "Q3 only needs to supply the SUBJECT or DATASET — e.g. 'security incidents', "
+            "'critical findings', 'delinquency rate'. Do NOT reject Q3 for lacking a "
+            "data type — that is Q2's job, not Q3's.\n"
+            "- A completely empty or nonsensical Q3 must be rejected. But any Q3 that "
+            "names a recognisable TFCU topic (security, incidents, findings, risk, loans, "
+            "members, deposits, etc.) is acceptable even if short.\n"
+            "- REQUIRED: A time period must be present either in the current query OR "
+            "in any prior turn shown in the conversation history. Accepted time periods: "
+            "today, this week, this month, this quarter, this year, last week, last month, "
+            "last quarter, last year, last 7 days, last 30 days, last 90 days, year to date, "
+            "YTD, month to date, MTD, or any specific date/range. "
+            "If no time period appears anywhere in the conversation history, return valid: false "
+            "and ask ONLY for a time period. Do NOT ask for it again if it was already given.\n"
             "- Do NOT invent defaults the user never said. But DO use Q1/Q2 "
             "intake answers as established facts — that is not inventing.\n"
             "- When coaching, request only the ONE dimension still missing "
-            "after merging ALL intake and history. Never re-ask for year over "
-            "year, time range, business unit, or metrics/trends/reports if "
-            "already captured in Q1, Q2, or prior turns."
+            "after merging ALL intake and history. Never re-ask for data type, "
+            "business unit, or time period if already captured in Q1, Q2, or prior turns."
         )
 
     # Build history context string for the prompt
@@ -902,9 +907,7 @@ def translate_text():
 
 
 Q2_INTAKE_QUESTION = (
-    "Please specify what kind of data you want — metrics, trends, or reports — "
-    "and whether you are looking for anything specific, such as year over year, "
-    "month over month, by branch, or similar."
+    "Can I help you by giving you a metric, trend or report? Pick one."
 )
 
 
@@ -1051,7 +1054,9 @@ def extract_answer():
                                     "stripping any filler phrases like 'I said', 'I meant', "
                                     "'can you show me', 'I want to see', 'give me', 'basically', etc. "
                                     "If the input is already a clean answer, return it unchanged. "
-                                    "Return ONLY the extracted answer — no explanation, no punctuation changes."
+                                    "IMPORTANT: Return ONLY the extracted answer — no follow-up questions, "
+                                    "no suggestions, no 'anything specific?', no extra commentary, "
+                                    "no punctuation changes. Just the answer itself, nothing else."
                                 ),
                             }
                         ],
