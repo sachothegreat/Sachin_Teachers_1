@@ -479,6 +479,7 @@
         }
       }
     </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.26.0/plotly.min.js"></script>
   </head>
   <body>
     <div class="app-shell">
@@ -516,6 +517,7 @@
         <div class="btn-row">
           <button type="button" id="start-realtime">Start realtime voice</button>
           <button type="button" id="stop-speaking" class="secondary" disabled>Stop &amp; re-ask</button>
+          <button type="button" id="pause-resume" class="secondary" disabled>Pause</button>
         </div>
         <div id="realtime-json" style="max-height:260px;overflow-y:auto;font-size:0.85rem;line-height:1.6;padding:8px 0;display:flex;flex-direction:column;gap:4px;"></div>
         <pre id="realtime-debug" class="panel-pre muted" style="display:none;"></pre>
@@ -576,6 +578,8 @@
       // Running conversation with the Cortex Agent so follow-ups refine the
       // previous answer. Each entry is { role: "user"|"assistant", text }.
       let cortexConversation = [];
+      // Q2 intent captured at intake time — used for chart selection.
+      let lastQ2Intent = "";
 
       // Relays a turn to the Cortex Agent. On the first turn pass the collected
       // answers; for a follow-up pass { followupText }. The running
@@ -631,9 +635,100 @@
         speakWithNaturalVoice(irrelevant ? CORTEX_IRRELEVANT_MSG : data.answer);
       }
 
-      // Builds a DOM node showing the natural-language answer plus the
-      // generated SQL and a data table from the semantic view. `onFollowup`
-      // (text, doneCb) is invoked when the user submits a refinement.
+      // ── Chart helpers ─────────────────────────────────────────────────────
+      function _pickChartType(q2Intent, columns, rows) {
+        const intent = (q2Intent || "").toLowerCase();
+        const hasRows = Array.isArray(rows) && rows.length > 0;
+        const cols = Array.isArray(columns) ? columns : [];
+
+        // Single numeric value → KPI card
+        if (hasRows && rows.length === 1 && cols.length === 1) return "kpi";
+
+        // Time column detected → line chart
+        const hasTimeCol = cols.some(c => /date|day|month|week|year|time|period|partition/i.test(c));
+        if (hasTimeCol || intent.includes("trend")) return "line";
+
+        // Metric with few rows → bar
+        if (intent.includes("metric")) return "bar";
+
+        // Report or default → bar
+        return "bar";
+      }
+
+      function _renderPlotlyChart(container, q2Intent, columns, rows) {
+        const cols = Array.isArray(columns) ? columns : [];
+        const hasRows = Array.isArray(rows) && rows.length > 0;
+        if (!hasRows) return false;
+
+        const chartType = _pickChartType(q2Intent, cols, rows);
+        const plotBg = "rgba(0,0,0,0)";
+        const paperBg = "rgba(0,0,0,0)";
+        const fontColor = "#cbd5e1";
+        const gridColor = "rgba(148,163,184,0.12)";
+
+        // Normalise rows: each row may be an array or an object
+        const toObj = (r) => {
+          if (Array.isArray(r)) {
+            const obj = {};
+            cols.forEach((c, i) => { obj[c] = r[i]; });
+            return obj;
+          }
+          return r;
+        };
+        const normalised = rows.map(toObj);
+
+        // KPI card — single big number
+        if (chartType === "kpi") {
+          const val = Object.values(normalised[0])[0];
+          const label = cols[0] || "Value";
+          container.innerHTML =
+            `<div style="text-align:center;padding:20px 0;">` +
+            `<div style="font-size:3rem;font-weight:700;color:#38bdf8;">${val}</div>` +
+            `<div style="font-size:0.8rem;color:#64748b;margin-top:4px;text-transform:uppercase;letter-spacing:0.08em;">${label}</div>` +
+            `</div>`;
+          return true;
+        }
+
+        // Identify x and y columns
+        const numericCols = cols.filter(c => normalised.every(r => !isNaN(parseFloat(r[c]))));
+        const categoryCols = cols.filter(c => !numericCols.includes(c));
+
+        const xCol = categoryCols[0] || cols[0];
+        const yCols = numericCols.length ? numericCols : cols.slice(1);
+        if (!yCols.length) return false;
+
+        const xVals = normalised.map(r => r[xCol]);
+        const traces = yCols.map((yc, i) => {
+          const colours = ["#38bdf8","#818cf8","#34d399","#fb923c","#f472b6"];
+          return {
+            x: xVals,
+            y: normalised.map(r => parseFloat(r[yc]) || 0),
+            name: yc,
+            type: chartType === "line" ? "scatter" : "bar",
+            mode: chartType === "line" ? "lines+markers" : undefined,
+            marker: { color: colours[i % colours.length] },
+            line: chartType === "line" ? { color: colours[i % colours.length], width: 2 } : undefined,
+          };
+        });
+
+        const layout = {
+          paper_bgcolor: paperBg,
+          plot_bgcolor: plotBg,
+          font: { color: fontColor, family: "DM Sans, sans-serif", size: 12 },
+          margin: { t: 20, r: 10, b: 60, l: 50 },
+          xaxis: { gridcolor: gridColor, tickfont: { color: fontColor } },
+          yaxis: { gridcolor: gridColor, tickfont: { color: fontColor } },
+          showlegend: yCols.length > 1,
+          legend: { font: { color: fontColor } },
+          barmode: "group",
+        };
+
+        Plotly.newPlot(container, traces, layout, { responsive: true, displayModeBar: false });
+        return true;
+      }
+
+      // Builds a DOM node showing a Plotly chart + narrated summary + follow-up.
+      // SQL and raw table are never shown to the user.
       function buildCortexResultNode(data, onFollowup) {
         const wrap = document.createElement("div");
         wrap.className = "cortex-result";
@@ -647,65 +742,24 @@
           return wrap;
         }
 
+        // Summary (narrated answer) — always shown
         if (data.answer) {
           const ans = document.createElement("div");
           ans.textContent = "Syntheia: " + data.answer;
-          ans.style.cssText = "margin-bottom:8px;color:#e2e8f0;";
+          ans.style.cssText = "margin-bottom:10px;color:#e2e8f0;";
           wrap.appendChild(ans);
         }
 
-        if (data.sql) {
-          const label = document.createElement("div");
-          label.textContent = "Generated SQL";
-          label.style.cssText =
-            "font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;" +
-            "color:#64748b;margin:6px 0 2px;";
-          const pre = document.createElement("pre");
-          pre.textContent = data.sql;
-          pre.style.cssText =
-            "white-space:pre-wrap;word-break:break-word;background:rgba(2,6,23,0.6);" +
-            "border-radius:6px;padding:8px;font-size:0.78rem;color:#7dd3fc;overflow-x:auto;margin:0;";
-          wrap.appendChild(label);
-          wrap.appendChild(pre);
-        }
-
+        // Plotly chart — shown when rows are available
         if (Array.isArray(data.rows) && data.rows.length) {
-          const cols = (data.columns && data.columns.length)
-            ? data.columns
-            : (Array.isArray(data.rows[0]) ? data.rows[0].map((_, i) => "col" + (i + 1)) : ["value"]);
-          const tbl = document.createElement("table");
-          tbl.style.cssText =
-            "border-collapse:collapse;margin-top:8px;width:100%;font-size:0.78rem;";
-          const thead = document.createElement("thead");
-          const htr = document.createElement("tr");
-          cols.forEach((c) => {
-            const th = document.createElement("th");
-            th.textContent = c;
-            th.style.cssText =
-              "border:1px solid rgba(148,163,184,0.25);padding:4px 8px;text-align:left;" +
-              "color:#94a3b8;background:rgba(255,255,255,0.03);";
-            htr.appendChild(th);
-          });
-          thead.appendChild(htr);
-          tbl.appendChild(thead);
-          const tbody = document.createElement("tbody");
-          data.rows.slice(0, 50).forEach((r) => {
-            const tr = document.createElement("tr");
-            (Array.isArray(r) ? r : [r]).forEach((cell) => {
-              const td = document.createElement("td");
-              td.textContent = (cell === null || cell === undefined) ? "" : String(cell);
-              td.style.cssText =
-                "border:1px solid rgba(148,163,184,0.18);padding:4px 8px;color:#cbd5e1;";
-              tr.appendChild(td);
-            });
-            tbody.appendChild(tr);
-          });
-          tbl.appendChild(tbody);
-          wrap.appendChild(tbl);
+          const chartDiv = document.createElement("div");
+          chartDiv.style.cssText = "width:100%;min-height:240px;margin-bottom:8px;";
+          wrap.appendChild(chartDiv);
+          // Defer so the element is in DOM before Plotly measures it
+          setTimeout(() => _renderPlotlyChart(chartDiv, lastQ2Intent, data.columns || [], data.rows), 0);
         }
 
-        // Follow-up input — lets the user refine or ask a related question
-        // with full conversation context.
+        // Typed follow-up input
         if (typeof onFollowup === "function") {
           const fu = document.createElement("div");
           fu.className = "cortex-followup";
@@ -779,6 +833,7 @@
       }
       const startRealtimeBtn = document.getElementById("start-realtime");
       const stopSpeakingBtn = document.getElementById("stop-speaking");
+      const pauseResumeBtn = document.getElementById("pause-resume");
       const startTypedIntakeBtn = document.getElementById("start-typed-intake");
       const typedIntakePanel = document.getElementById("typed-intake-panel");
       const typedQuestionEl = document.getElementById("typed-question");
@@ -857,6 +912,10 @@
       let q3History = [];          // Q3-specific attempt/coaching pairs (up to 10 entries)
       let voiceQ3Attempts = 0;     // how many times the voice Q3 validator has rejected this run
       const VOICE_Q3_MAX_ATTEMPTS = 3; // after this many rejections, fall open so the user is never stuck
+      // Pause/resume state
+      let isPaused = false;
+      let pausedSnapshot = null; // saved state when paused
+
       const voiceAcknowledgments = ["Got it.", "Thanks.", "Perfect.", "Nice.", "Okay."];
       function randomVoiceAck() {
         return voiceAcknowledgments[Math.floor(Math.random() * voiceAcknowledgments.length)];
@@ -1141,8 +1200,12 @@
           t === "correct" ||
           t === "that's right" ||
           t === "thats right" ||
+          t === "thank you" ||
+          t === "thanks" ||
           t.includes("yes") ||
-          t.includes("correct")
+          t.includes("correct") ||
+          t.includes("thank you") ||
+          t.includes("thanks")
         );
       }
       function isNoConfirmation(transcript) {
@@ -1513,6 +1576,7 @@
 
       async function submitTypedIntake2() {
         cortexConversation = [];
+        lastQ2Intent = (typedIntake2Answers.summary || "").toLowerCase();
         typed2StatusEl.textContent = "Please hold on while I fetch you the results...";
         const data = await relayToCortex(typedIntake2Answers);
         if (data.error) {
@@ -1614,6 +1678,7 @@
 
       async function submitTypedIntake() {
         cortexConversation = [];
+        lastQ2Intent = (typedIntakeAnswers.summary || "").toLowerCase();
         realtimeStatusEl.textContent = "Please hold on while I fetch you the results...";
         appendTranscript("Syntheia", "Got it — relaying that to the data system now.");
         const data = await relayToCortex(typedIntakeAnswers);
@@ -1830,6 +1895,7 @@
               console.error("audio.play() rejected (autoplay policy?):", err);
               realtimeStatusEl.textContent =
                 "Audio blocked by browser. Click anywhere on the page, then Start Realtime Voice again.";
+              setMicMuted(false);
               if (onEnd) onEnd();
             });
           }
@@ -1883,6 +1949,7 @@
         cortexConversation = [];
         realtimeStatusEl.textContent = "Fetching your results...";
         speakWithNaturalVoice("Please hold on while I fetch you the results.", async () => {
+          lastQ2Intent = (voiceIntakeAnswers.summary || "").toLowerCase();
           const data = await relayToCortex(voiceIntakeAnswers);
           if (data.error) {
             realtimeStatusEl.textContent = "Connection error.";
@@ -1925,6 +1992,9 @@
         if (msg.type === "conversation.item.input_audio_transcription.completed") {
           if (intentSubmitted || finalIntentRequested || realtimeAwaitingTicket) {
             return;
+          }
+          if (isPaused) {
+            return; // ignore all speech while paused
           }
           clearWatchdog();
           const rawTranscript = String(msg.transcript || "").trim();
@@ -2085,13 +2155,25 @@
                   return;
                 }
               }
-              voiceIntakeAnswers[key] = value;
-              pendingVoiceConfirmation = null;
-              // Q3 confirmed — clear the Q3-specific history and reset attempts
+              // Q3: combine ALL confirmed user turns across retries into one
+              // comprehensive query so nothing is lost between re-asks.
               if (step === 2) {
+                const q3UserTurns = q3History
+                  .filter(t => t.role === "user")
+                  .map(t => (t.content || "").trim())
+                  .filter(Boolean);
+                // Add current confirmed value if not already present
+                const valueLc = value.toLowerCase();
+                if (!q3UserTurns.some(t => t.toLowerCase() === valueLc)) {
+                  q3UserTurns.push(value);
+                }
+                voiceIntakeAnswers[key] = q3UserTurns.join(". ");
                 q3History = [];
                 voiceQ3Attempts = 0;
+              } else {
+                voiceIntakeAnswers[key] = value;
               }
+              pendingVoiceConfirmation = null;
               voiceIntakeStep = step + 1;
               if (voiceIntakeStep >= voiceIntakeQuestions.length) {
                 const echo = shortEcho(value);
@@ -2286,7 +2368,7 @@
                   const coreWords = coreAnswer.trim().split(/\s+/).length;
                   if (coreWords >= Math.ceil(origWords * 0.7)) {
                     pendingVoiceConfirmation.value = coreAnswer;
-                    realtimeStatusEl.textContent = `Confirming (${getStepLabel(step)}): ${shortEcho(coreAnswer)}`;
+                    // Status stays showing what the user actually said — no AI rewrite in the UI.
                   }
                 }
               }
@@ -2694,10 +2776,95 @@
           realtimeIsStopping = false;
           startRealtimeBtn.disabled = true;
           stopSpeakingBtn.disabled = false;
+          pauseResumeBtn.disabled = false;
         } catch (error) {
           realtimeStatusEl.textContent = `Realtime failed: ${error.message}`;
           stopRealtime();
         }
+      }
+
+      function pauseRealtime() {
+        if (!realtimeIsActive || isPaused || intentSubmitted) return;
+        isPaused = true;
+
+        // Stop TTS immediately
+        try {
+          assistantAudioEl.pause();
+          assistantAudioEl.onended = null;
+        } catch (_) {}
+        speakJobId++; // cancel any in-flight TTS
+        setMicMuted(true);
+        clearWatchdog();
+
+        // Save full state snapshot
+        pausedSnapshot = {
+          step: voiceIntakeStep,
+          answers: { ...voiceIntakeAnswers },
+          pendingConfirmation: pendingVoiceConfirmation
+            ? { ...pendingVoiceConfirmation }
+            : null,
+          introPhase: introPhase,
+          q3History: [...q3History],
+          voiceQ3Attempts: voiceQ3Attempts,
+        };
+
+        realtimeStatusEl.textContent = "Paused.";
+        appendTranscript("Syntheia", "Paused. Tap resume when you're ready to continue.");
+        pauseResumeBtn.textContent = "Resume";
+      }
+
+      function resumeRealtime() {
+        if (!realtimeIsActive || !isPaused || !pausedSnapshot) return;
+        isPaused = false;
+
+        // Restore state
+        voiceIntakeStep = pausedSnapshot.step;
+        voiceIntakeAnswers = { ...pausedSnapshot.answers };
+        pendingVoiceConfirmation = pausedSnapshot.pendingConfirmation
+          ? { ...pausedSnapshot.pendingConfirmation }
+          : null;
+        introPhase = pausedSnapshot.introPhase;
+        q3History = [...pausedSnapshot.q3History];
+        voiceQ3Attempts = pausedSnapshot.voiceQ3Attempts;
+        pausedSnapshot = null;
+
+        setMicMuted(false);
+        pauseResumeBtn.textContent = "Pause";
+
+        // Resume from the right place
+        if (pendingVoiceConfirmation) {
+          // Mid yes/no confirmation — replay it
+          const echo = ttsEcho(pendingVoiceConfirmation.value);
+          realtimeStatusEl.textContent = "Resuming confirmation...";
+          speakWithNaturalVoice(
+            `Welcome back. I had heard "${echo}". Is that still correct? Please say yes or no.`
+          );
+          return;
+        }
+
+        if (introPhase === INTRO_PHASE.QUESTIONING) {
+          // Between questions or mid-question
+          const step = voiceIntakeStep;
+          if (step === 0) {
+            speakWithNaturalVoice(
+              "Welcome back. Let's pick up where we left off. What domain are you looking for insights for?"
+            );
+          } else if (step === 1) {
+            speakWithNaturalVoice(
+              `Welcome back. Question 2 of 3 — ${Q2_INTAKE_PROMPT}`
+            );
+          } else if (step === 2) {
+            speakWithNaturalVoice(
+              "Welcome back. Last question — what query would you like relayed?"
+            );
+          } else {
+            askCurrentVoiceQuestion("Welcome back.");
+          }
+          return;
+        }
+
+        // Fallback: re-ask current question
+        askCurrentVoiceQuestion("Welcome back.");
       }
 
       function stopRealtime(reason = "Realtime stopped.") {
@@ -2723,6 +2890,10 @@
         peerConnection = null;
         startRealtimeBtn.disabled = false;
         stopSpeakingBtn.disabled = true;
+        pauseResumeBtn.disabled = true;
+        pauseResumeBtn.textContent = "Pause";
+        isPaused = false;
+        pausedSnapshot = null;
         try {
           assistantAudioEl.pause();
           assistantAudioEl.onended = null;
@@ -2806,6 +2977,7 @@
 
       startRealtimeBtn.addEventListener("click", startRealtime);
       stopSpeakingBtn.addEventListener("click", stopTalkingAndReask);
+      pauseResumeBtn.addEventListener("click", () => { isPaused ? resumeRealtime() : pauseRealtime(); });
       startTypedIntakeBtn.addEventListener("click", startTypedIntake);
       typedNextBtn.addEventListener("click", handleTypedNext);
       typedCancelBtn.addEventListener("click", cancelTypedIntake);

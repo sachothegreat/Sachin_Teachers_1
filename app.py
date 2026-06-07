@@ -1028,7 +1028,7 @@ def extract_answer():
     question_map = {
         0: "Which business unit are you with?",
         1: Q2_INTAKE_QUESTION,
-        2: "This is question three, the user's actual query: what specific query would you like me to run?",
+        2: "What query would you like relayed?",
     }
     current_question = question_map.get(step, "What are you looking for?")
 
@@ -1106,7 +1106,7 @@ def bridge_interrupt():
     question_map = {
         0: "Which business unit are you with?",
         1: Q2_INTAKE_QUESTION,
-        2: "This is question three, the user's actual query: what specific query would you like me to run?",
+        2: "What query would you like relayed?",
     }
     current_question = question_map.get(step, "What are you looking for?")
 
