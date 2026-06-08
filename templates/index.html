@@ -2368,7 +2368,6 @@
                   const coreWords = coreAnswer.trim().split(/\s+/).length;
                   if (coreWords >= Math.ceil(origWords * 0.7)) {
                     pendingVoiceConfirmation.value = coreAnswer;
-                    // Status stays showing what the user actually said — no AI rewrite in the UI.
                   }
                 }
               }
