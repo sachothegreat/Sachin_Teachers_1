@@ -60,7 +60,7 @@
         flex: 1;
         min-width: 0;
         padding: clamp(20px, 4vw, 40px);
-        max-width: 980px;
+        max-width: 100%;
       }
 
       .page-header {
@@ -123,7 +123,7 @@
       }
 
       .container {
-        max-width: 920px;
+        max-width: 100%;
         margin: 0;
         padding: 0;
       }
@@ -331,6 +331,7 @@
       }
 
       .tickets-rail {
+        display: none !important;
         width: min(380px, 38vw);
         flex-shrink: 0;
         background: linear-gradient(180deg, #050810 0%, #0a0f1a 40%, #060a12 100%);
@@ -632,7 +633,7 @@
         const irrelevant = data.irrelevant || (!data.answer && !(data.rows && data.rows.length));
         renderFn(data);
         statusFn(irrelevant ? "Query not found in our data." : "Results ready.");
-        speakWithNaturalVoice(irrelevant ? CORTEX_IRRELEVANT_MSG : data.answer);
+        speakWithNaturalVoice(irrelevant ? CORTEX_IRRELEVANT_MSG : _extractTTSSummary(data.answer));
       }
 
       // ── Chart helpers ─────────────────────────────────────────────────────
@@ -727,8 +728,143 @@
         return true;
       }
 
-      // Builds a DOM node showing a Plotly chart + narrated summary + follow-up.
-      // SQL and raw table are never shown to the user.
+      // ── Answer parsing helpers ────────────────────────────────────────────
+
+      // Parse newline-separated pipe-table lines into {columns, rows}.
+      function _parseMarkdownTable(tableLines) {
+        if (!tableLines || tableLines.length < 2) return null;
+        const splitRow = (l) => l.split('|').slice(1, -1).map(c => c.trim());
+        const columns = splitRow(tableLines[0]).filter(c => c.length > 0);
+        if (!columns.length) return null;
+        const rows = [];
+        for (let j = 2; j < tableLines.length; j++) {
+          const cells = splitRow(tableLines[j]);
+          // Skip separator rows (all dashes/colons)
+          if (cells.length && !cells.every(c => /^[-: ]+$/.test(c))) rows.push(cells);
+        }
+        return rows.length ? { columns, rows } : null;
+      }
+
+      // Normalises a raw table string where all rows may be concatenated on one line,
+      // e.g. "| A | B | |---| | x | y |", into newline-separated rows, then parses it.
+      // Works by inserting \n at every row boundary: whitespace between two adjacent |.
+      function _parseTableStr(tableStr) {
+        // (?<=\|)\s+(?=\|) — whitespace that sits between two pipe characters (row boundary).
+        // Replace with \n so rows fall on separate lines, then reuse _parseMarkdownTable.
+        const normalized = tableStr.replace(/(?<=\|)\s+(?=\|)/g, '\n');
+        const tableLines = normalized.split('\n').map(l => l.trim()).filter(l => l.startsWith('|'));
+        return _parseMarkdownTable(tableLines);
+      }
+
+      // Returns true when a line that does NOT start with | still contains an embedded
+      // pipe table (prose intermixed with | table | content).
+      function _lineHasInlineTable(line) {
+        if (/^\s*\|/.test(line)) return false;                  // pure table line — handled separately
+        if ((line.match(/\|/g) || []).length < 3) return false; // too few pipes to be a table
+        return /\|[\s]*[-:]+[\s]*\|/.test(line);                // must contain a separator cell
+      }
+
+      // Splits a line that mixes prose and an embedded table.
+      // Returns { prose: "text before + after", tableStr: "| col | ... |" }
+      function _splitLineWithInlineTable(line) {
+        const firstPipe = line.indexOf('|');
+        const lastPipe  = line.lastIndexOf('|');
+        const prose = [line.slice(0, firstPipe).trim(), line.slice(lastPipe + 1).trim()]
+          .filter(Boolean).join(' ');
+        const tableStr = line.slice(firstPipe, lastPipe + 1).trim();
+        return { prose, tableStr };
+      }
+
+      // Strips all pipe-table segments from a prose line, returning surrounding text only.
+      // Used by _extractTTSSummary to clean lines that are not pure table lines.
+      function _stripPipesFromLine(line) {
+        if (!/\|/.test(line)) return line;
+        if (/^\s*\|/.test(line)) return '';           // pure table line — caller already drops these
+        const firstPipe = line.indexOf('|');
+        const lastPipe  = line.lastIndexOf('|');
+        return [line.slice(0, firstPipe).trim(), line.slice(lastPipe + 1).trim()]
+          .filter(Boolean).join(' ');
+      }
+
+      // Split data.answer into:
+      //   summaryText — prose only: headings demoted, inline markdown stripped,
+      //                 ALL table content removed (line-start tables AND inline tables)
+      //   parsedTables — [{columns, rows}] extracted from every pipe-table found
+      function _parseAnswerForDisplay(answer) {
+        if (!answer) return { summaryText: "", parsedTables: [] };
+        const lines = answer.split('\n');
+        const summaryLines = [];
+        const parsedTables = [];
+        let i = 0;
+        while (i < lines.length) {
+          const line = lines[i];
+
+          // Pure table block — collect contiguous pipe-leading lines, parse as one table
+          if (/^\s*\|/.test(line)) {
+            const tblLines = [];
+            while (i < lines.length && /^\s*\|/.test(lines[i])) tblLines.push(lines[i++]);
+            const parsed = _parseMarkdownTable(tblLines);
+            if (parsed) parsedTables.push(parsed);
+            continue;
+          }
+
+          // Line that mixes prose with an inline pipe table
+          if (_lineHasInlineTable(line)) {
+            const { prose, tableStr } = _splitLineWithInlineTable(line);
+            if (prose) summaryLines.push(
+              prose
+                .replace(/\*\*([^*]+)\*\*/g, '$1')
+                .replace(/\*([^*]+)\*/g, '$1')
+                .replace(/`([^`]+)`/g, '$1')
+            );
+            const parsed = _parseTableStr(tableStr);
+            if (parsed) parsedTables.push(parsed);
+            i++;
+            continue;
+          }
+
+          // Heading — strip # prefix, keep plain text
+          const hm = line.match(/^#{1,6}\s+(.+)/);
+          if (hm) { summaryLines.push(hm[1].trim()); i++; continue; }
+
+          // Blockquote / footnote — discard
+          if (/^>\s/.test(line)) { i++; continue; }
+
+          // Normal prose line — strip inline markdown markers
+          summaryLines.push(
+            line
+              .replace(/\*\*([^*]+)\*\*/g, '$1')
+              .replace(/\*([^*]+)\*/g, '$1')
+              .replace(/`([^`]+)`/g, '$1')
+          );
+          i++;
+        }
+        const summaryText = summaryLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+        return { summaryText, parsedTables };
+      }
+
+      // Returns clean prose for TTS — strips ALL table content (both line-start and
+      // inline), headings, blockquotes, and inline markdown. Never contains pipe chars.
+      function _extractTTSSummary(answer) {
+        if (!answer) return "";
+        return answer.split('\n')
+          .filter(l => !/^\s*\|/.test(l))      // drop pure table lines
+          .filter(l => !/^#{1,6}\s/.test(l))   // drop heading lines
+          .filter(l => !/^>\s/.test(l))         // drop blockquotes
+          .map(l => _stripPipesFromLine(l))     // strip inline table segments from mixed lines
+          .map(l => l
+            .replace(/\*\*([^*]+)\*\*/g, '$1')
+            .replace(/\*([^*]+)\*/g, '$1')
+            .replace(/`([^`]+)`/g, '$1')
+            .trim()
+          )
+          .filter(l => l.length > 0)
+          .join(' ')
+          .trim();
+      }
+
+      // Builds a DOM node: Summary → Plotly chart → Data Table(s) → follow-up input.
+      // SQL and raw markdown are never shown to the user.
       function buildCortexResultNode(data, onFollowup) {
         const wrap = document.createElement("div");
         wrap.className = "cortex-result";
@@ -742,24 +878,97 @@
           return wrap;
         }
 
-        // Summary (narrated answer) — always shown
-        if (data.answer) {
+        // Parse answer: prose summary + any embedded markdown tables
+        const { summaryText, parsedTables } = _parseAnswerForDisplay(data.answer || "");
+
+        // ── 1. Summary section ────────────────────────────────────────────
+        if (summaryText) {
+          const summaryLabel = document.createElement("div");
+          summaryLabel.textContent = "Summary";
+          summaryLabel.style.cssText =
+            "font-size:0.78rem;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;" +
+            "color:#94a3b8;margin-bottom:6px;";
+          wrap.appendChild(summaryLabel);
+
           const ans = document.createElement("div");
-          ans.textContent = "Syntheia: " + data.answer;
-          ans.style.cssText = "margin-bottom:10px;color:#e2e8f0;";
+          ans.textContent = summaryText;
+          ans.style.cssText = "margin-bottom:12px;color:#e2e8f0;white-space:pre-wrap;";
           wrap.appendChild(ans);
         }
 
-        // Plotly chart — shown when rows are available
+        // ── 2. Plotly chart ───────────────────────────────────────────────
         if (Array.isArray(data.rows) && data.rows.length) {
           const chartDiv = document.createElement("div");
           chartDiv.style.cssText = "width:100%;min-height:240px;margin-bottom:8px;";
           wrap.appendChild(chartDiv);
-          // Defer so the element is in DOM before Plotly measures it
+          // Defer so element is in DOM before Plotly measures it
           setTimeout(() => _renderPlotlyChart(chartDiv, lastQ2Intent, data.columns || [], data.rows), 0);
         }
 
-        // Typed follow-up input
+        // ── 3. Data Table section ─────────────────────────────────────────
+        // Prefer structured data.rows/columns from the API; fall back to tables
+        // parsed out of the markdown answer when no structured rows exist.
+        const tableSource = (Array.isArray(data.rows) && data.rows.length &&
+                             Array.isArray(data.columns) && data.columns.length)
+          ? [{ columns: data.columns, rows: data.rows }]
+          : parsedTables;
+
+        tableSource.forEach((tbl, tblIdx) => {
+          if (!tbl.columns.length || !tbl.rows.length) return;
+          const tableSection = document.createElement("div");
+          tableSection.style.cssText = "margin-top:14px;margin-bottom:8px;";
+
+          const tableHeading = document.createElement("div");
+          tableHeading.textContent = tableSource.length > 1 ? `Data Table ${tblIdx + 1}` : "Data Table";
+          tableHeading.style.cssText =
+            "font-size:0.78rem;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;" +
+            "color:#94a3b8;margin-bottom:6px;";
+          tableSection.appendChild(tableHeading);
+
+          const tableWrap = document.createElement("div");
+          tableWrap.style.cssText = "overflow-x:auto;border-radius:6px;border:1px solid rgba(148,163,184,0.15);";
+
+          const table = document.createElement("table");
+          table.style.cssText =
+            "width:100%;border-collapse:collapse;font-size:0.78rem;font-family:var(--mono,monospace);";
+
+          // Header row
+          const thead = document.createElement("thead");
+          const headerRow = document.createElement("tr");
+          headerRow.style.cssText = "background:rgba(14,165,233,0.08);";
+          tbl.columns.forEach((col) => {
+            const th = document.createElement("th");
+            th.textContent = col;
+            th.style.cssText =
+              "padding:6px 10px;text-align:left;color:#7dd3fc;font-weight:600;" +
+              "border-bottom:1px solid rgba(148,163,184,0.15);white-space:nowrap;";
+            headerRow.appendChild(th);
+          });
+          thead.appendChild(headerRow);
+          table.appendChild(thead);
+
+          // Data rows
+          const tbody = document.createElement("tbody");
+          tbl.rows.forEach((row, ri) => {
+            const tr = document.createElement("tr");
+            tr.style.cssText = ri % 2 === 0 ? "background:transparent;" : "background:rgba(255,255,255,0.02);";
+            tbl.columns.forEach((col, ci) => {
+              const td = document.createElement("td");
+              const val = Array.isArray(row) ? row[ci] : row[col];
+              td.textContent = val === null || val === undefined ? "—" : val;
+              td.style.cssText =
+                "padding:5px 10px;color:#cbd5e1;border-bottom:1px solid rgba(148,163,184,0.08);";
+              tr.appendChild(td);
+            });
+            tbody.appendChild(tr);
+          });
+          table.appendChild(tbody);
+          tableWrap.appendChild(table);
+          tableSection.appendChild(tableWrap);
+          wrap.appendChild(tableSection);
+        });
+
+        // ── 4. Follow-up input ────────────────────────────────────────────
         if (typeof onFollowup === "function") {
           const fu = document.createElement("div");
           fu.className = "cortex-followup";
@@ -901,7 +1110,7 @@
       const Q3_QUERY_PROMPT =
         "What query would you like relayed?";
       const voiceIntakeQuestions = [
-        "What domain are you looking for insights for?",
+        "What domain can I assist you with today?",
         Q2_INTAKE_PROMPT,
         Q3_QUERY_PROMPT,
       ];
@@ -1223,7 +1432,7 @@
         );
       }
       const typedIntakeQuestions = [
-        { key: "business_unit", prompt: "What domain are you looking for insights for?" },
+        { key: "business_unit", prompt: "What domain can I assist you with today?" },
         { key: "summary", prompt: Q2_INTAKE_PROMPT },
         { key: "details", prompt: Q3_QUERY_PROMPT + " Please be specific and banking-related." },
       ];
@@ -1588,7 +1797,7 @@
         const isIrrelevant = data.irrelevant || (!data.answer && !(data.rows && data.rows.length));
         typed2StatusEl.textContent = isIrrelevant ? "Query not found in our data." : "Results ready.";
         showCortexInPanel(typed2StatusEl.parentNode, typed2StatusEl, data);
-        speakWithNaturalVoice(isIrrelevant ? CORTEX_IRRELEVANT_MSG : data.answer);
+        speakWithNaturalVoice(isIrrelevant ? CORTEX_IRRELEVANT_MSG : _extractTTSSummary(data.answer));
       }
 
       async function handleTypedNext2() {
@@ -1691,7 +1900,7 @@
         const isIrrelevant = data.irrelevant || (!data.answer && !(data.rows && data.rows.length));
         showCortexInTranscript(data);
         realtimeStatusEl.textContent = isIrrelevant ? "Query not found in our data." : "Results ready.";
-        speakWithNaturalVoice(isIrrelevant ? CORTEX_IRRELEVANT_MSG : data.answer);
+        speakWithNaturalVoice(isIrrelevant ? CORTEX_IRRELEVANT_MSG : _extractTTSSummary(data.answer));
       }
 
       async function handleTypedNext() {
@@ -1714,7 +1923,7 @@
         if (current.key === "business_unit") {
           const isCyber = /cyber|cybersecurity|cyber security|infosec|information security|security/i.test(answer);
           if (!isCyber) {
-            typedQuestionEl.textContent = "Wrong department. This system only supports cybersecurity insights. What domain are you looking for insights for?";
+            typedQuestionEl.textContent = "Wrong department. This system only supports cybersecurity insights. What domain can I assist you with today?";
             typedAnswerEl.value = "";
             typedAnswerEl.focus();
             return;
@@ -1961,7 +2170,7 @@
           const isIrrelevant = data.irrelevant || (!data.answer && !(data.rows && data.rows.length));
           showCortexInTranscript(data);
           realtimeStatusEl.textContent = isIrrelevant ? "Query not found in our data." : "Results ready.";
-          speakWithNaturalVoice(isIrrelevant ? CORTEX_IRRELEVANT_MSG : data.answer, () => stopRealtime());
+          speakWithNaturalVoice(isIrrelevant ? CORTEX_IRRELEVANT_MSG : _extractTTSSummary(data.answer), () => stopRealtime());
         });
       }
 
@@ -2119,14 +2328,14 @@
               // accept whatever came back to avoid trapping the user.
               if (step === 2) {
                 // Hardcoded time period check — runs before AI validation
-                const TIME_PERIOD_REGEX = /\b(today|this week|this month|this quarter|this year|last week|last month|last quarter|last year|last \d+ days?|last \d+ months?|year to date|ytd|month to date|mtd|\d{4}|january|february|march|april|may|june|july|august|september|october|november|december)\b/i;
+                const TIME_PERIOD_REGEX = /\b(today|this week|this month|this quarter|this year|last week|last month|last quarter|last year|last \d+ days?|last \d+ months?|last \d+ years?|last \d+ weeks?|past \d+ days?|past \d+ months?|past \d+ years?|past \d+ weeks?|year to date|ytd|month to date|mtd|\d{4}|january|february|march|april|may|june|july|august|september|october|november|december|(last|past|over the last|prior|previous)\s+(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty|sixty|ninety)\s+(days?|weeks?|months?|years?)|(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty|sixty|ninety)\s+(days?|weeks?|months?|years?)(\s+ago)?)\b/i;
                 const allQ3Text = q3History.map(t => t.content).join(" ") + " " + (value || "");
                 if (!TIME_PERIOD_REGEX.test(allQ3Text)) {
                   voiceQ3Attempts += 1;
                   pendingVoiceConfirmation = null;
                   const timingMsg = "Could you also include a time period? For example, this month, last quarter, or last 30 days.";
                   q3History.push({ role: "assistant", content: timingMsg });
-                  speakWithNaturalVoice(`${timingMsg} So let me ask again — what query would you like relayed?`);
+                  speakWithNaturalVoice(`${timingMsg} What query would you like relayed?`);
                   return;
                 }
                 if (validation === null) {
@@ -2140,7 +2349,7 @@
                   pendingVoiceConfirmation = null;
                   const coaching = validation.suggestion || "Try something more specific and banking-related.";
                   q3History.push({ role: "assistant", content: coaching });
-                  speakWithNaturalVoice(`${coaching} So let me ask again — what query would you like relayed?`);
+                  speakWithNaturalVoice(`${coaching} What query would you like relayed?`);
                   return;
                 }
               }
@@ -2149,7 +2358,7 @@
                 const isCyber = /cyber|cybersecurity|cyber security|infosec|information security|security/i.test(value);
                 if (!isCyber) {
                   pendingVoiceConfirmation = null;
-                  const wrongMsg = "Wrong department. This system only supports cybersecurity insights. What domain are you looking for insights for?";
+                  const wrongMsg = "Wrong department. This system only supports cybersecurity insights. What domain can I assist you with today?";
                   realtimeStatusEl.textContent = "Wrong department.";
                   speakWithNaturalVoice(wrongMsg);
                   return;
@@ -2204,9 +2413,9 @@
             }
             const pendingEcho = shortEcho(pendingVoiceConfirmation.value);
             realtimeStatusEl.textContent =
-              "Please say yes or no so I can confirm your answer.";
+              "Please confirm your answer.";
             speakWithNaturalVoice(
-              `I heard "${pendingEcho}". Is that correct? Please say yes or no.`
+              `I heard "${pendingEcho}". Is that correct?`
             );
             return;
           }
@@ -2279,8 +2488,8 @@
               realtimeStatusEl.textContent = `Confirming (${getStepLabel(bridgeStep)}): ${shortEcho(extracted)}`;
               // For non-Q2 bridge resolutions, keep explicit yes/no confirmation.
               const ack = bridgeResult.bridge_response
-                ? `${bridgeResult.bridge_response.replace(/[.!?]+$/, "")}. Is that correct? Please say yes or no.`
-                : `Got it — I heard "${shortEcho(extracted)}". Is that correct? Please say yes or no.`;
+                ? `${bridgeResult.bridge_response.replace(/[.!?]+$/, "")}. Is that correct?`
+                : `Got it — I heard "${shortEcho(extracted)}". Is that correct?`;
               if (bridgeStep === 2) {
                 q3History.push({ role: "user", content: rawTranscript });
                 const voiceQ3HistoryBridge = buildVoiceQ3ValidationHistory();
@@ -2355,7 +2564,7 @@
           const echo = shortEcho(q2AnswerForConfirm);
           const spokenEcho = ttsEcho(q2AnswerForConfirm);
           realtimeStatusEl.textContent = `Confirming (${getStepLabel(step)}): ${echo}`;
-          speakWithNaturalVoice(`I heard "${spokenEcho}". Is that correct? Please say yes or no.`);
+          speakWithNaturalVoice(`I heard "${spokenEcho}". Is that correct?`);
           // Background: AI extraction only for Q3 — Q1/Q2 answers are short and don't need it,
           // and running it on every step adds a concurrent API call that delays TTS
           if (step === 2) {
@@ -2741,7 +2950,7 @@
             realtimeStatusEl.textContent =
               "Connected — Syntheia is listening.";
             speakWithNaturalVoice(
-              "Hi, Teachers Employee. I'm Syntheia. I can help you explore our Enterprise Data for Insights. Before we get started, which business unit are you with?"
+              "Hi Teachers Executive. Good day. I am Syntheia, your AI-powered data assistant. I am here to help you explore enterprise data and answer questions to uncover meaningful insights. What domain can I assist you with today?"
             );
           };
 
@@ -2836,7 +3045,7 @@
           const echo = ttsEcho(pendingVoiceConfirmation.value);
           realtimeStatusEl.textContent = "Resuming confirmation...";
           speakWithNaturalVoice(
-            `Welcome back. I had heard "${echo}". Is that still correct? Please say yes or no.`
+            `Welcome back. I had heard "${echo}". Is that still correct?`
           );
           return;
         }
@@ -2846,7 +3055,7 @@
           const step = voiceIntakeStep;
           if (step === 0) {
             speakWithNaturalVoice(
-              "Welcome back. Let's pick up where we left off. What domain are you looking for insights for?"
+              "Welcome back. Let's pick up where we left off. What domain can I assist you with today?"
             );
           } else if (step === 1) {
             speakWithNaturalVoice(
