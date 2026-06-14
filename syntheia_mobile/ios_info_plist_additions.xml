@@ -1,0 +1,24 @@
+<!--
+  Add these keys inside the <dict> block of your ios/Runner/Info.plist
+  AFTER running `flutter create syntheia_mobile`.
+  The file is at: syntheia_mobile/ios/Runner/Info.plist
+-->
+
+<!-- Microphone permission (required for voice intake) -->
+<key>NSMicrophoneUsageDescription</key>
+<string>Syntheia needs microphone access for voice intake.</string>
+
+<!-- Camera permission (required for presence detection) -->
+<key>NSCameraUsageDescription</key>
+<string>Syntheia needs camera access for presence detection.</string>
+
+<!-- Allow HTTP to local network (Flask runs on http://, not https://) -->
+<key>NSAppTransportSecurity</key>
+<dict>
+  <key>NSAllowsArbitraryLoads</key>
+  <true/>
+</dict>
+
+<!-- Allow microphone/camera access inside WKWebView (iOS 15+) -->
+<key>NSBonjourServices</key>
+<array/>
